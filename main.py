@@ -106,14 +106,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-    elif data.startswith('edit_'):
-        user_states[user_id]['editing'] = True
-        user_states[user_id]['data'] = database.get_report(user_id, datetime.now().strftime('%Y-%m-%d')) or \
-                                       user_states[user_id]['data']
-        user_states[user_id]['step'] = 0
+    elif data == 'edit_report':
+        # Инициализируем состояние, если его нет
+        if user_id not in user_states:
+            role = database.get_user_role(user_id) or 'manual'  # Для manual роли нет в БД
+            user_states[user_id] = {'mode': role, 'step': 0, 'data': {}, 'editing': True}
+        else:
+            user_states[user_id]['editing'] = True
+            user_states[user_id]['step'] = 0
+
+        # Загружаем данные из БД (для employee/manager) или пустые (для manual)
+        report_date = datetime.now().strftime('%Y-%m-%d')
+        report_data = database.get_report(user_id, report_date) or {}
+        user_states[user_id]['data'] = report_data
+
         await start_filling(query, user_id, editing=True)
 
-    # Обработка дат (упрощённо, без календаря - пользователь введёт текстом)
+    elif data == 'send_report':
+        # Отправка отчёта руководителям (для employee)
+        report_date = datetime.now().strftime('%Y-%m-%d')
+        data = database.get_report(user_id, report_date)
+        if data:
+            formatted = config.format_report(data)
+            for manager_id in config.ALLOWED_MANAGERS:
+                try:
+                    await context.bot.send_message(chat_id=manager_id,
+                                                   text=f"Отчёт от сотрудника {user_id} на {report_date}:\n{formatted}")
+                except Exception as e:
+                    print(f"Ошибка отправки менеджеру {manager_id}: {e}")  # Лог для отладки
+            await query.edit_message_text("Отчёт отправлен руководителю.")
+        else:
+            await query.edit_message_text("Ошибка: отчёт не найден.")
+
+    elif data == 'edit_combined':
+        # Заглушка для редактирования объединённого отчёта (если нужно реализовать - добавьте логику суммирования)
+        await query.edit_message_text("Редактирование объединённого отчёта пока не поддерживается.")
+
     elif data.startswith('select_date_'):
         mode = data.split('_')[2]
         await query.edit_message_text("Введите дату (YYYY-MM-DD):")
@@ -124,6 +152,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     text = update.message.text.strip()
     state = user_states.get(user_id, {})
+    if not state:
+        await update.message.reply_text("Сессия истекла. Начните заново с /start.")
+        return
 
     if 'select_mode' in state:
         # Обработка ввода даты
@@ -271,7 +302,7 @@ async def finish_report(message, user_id):
 
     if state['mode'] != 'manual':
         database.save_report(user_id, data)
-    del user_states[user_id]  # Сброс состояния
+    # del user_states[user_id]  # Не удаляем, чтобы состояние сохранилось для редактирования
 
 
 async def show_manager_menu(query):
