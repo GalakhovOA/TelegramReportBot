@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import config
 import database
@@ -9,20 +9,22 @@ from datetime import datetime
 load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN')
 
-# Состояния пользователя (для FSM-подобной логики)
-user_states = {}  # {user_id: {'mode': 'manual/employee/manager', 'step': 0, 'data': {}, 'editing': False}}
+# Состояния пользователя
+user_states = {}  # {user_id: {'mode': 'manual/mkk/rtp', 'step': 0, 'data': {}, 'editing': False, 'entering_name': False, 'choosing_rtp': False}}
 
+# Постоянная inline-клавиатура для возврата в меню
+main_inline_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')]])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     keyboard = [
-        [InlineKeyboardButton("Сотрудник", callback_data='role_employee')],
-        [InlineKeyboardButton("Руководитель", callback_data='role_manager')],
-        [InlineKeyboardButton("Ручное заполнение", callback_data='role_manual')]
+        [InlineKeyboardButton("Отчет МКК", callback_data='role_mkk')],
+        [InlineKeyboardButton("Отчеты РТП", callback_data='role_rtp')],
+        [InlineKeyboardButton("Ручное заполнение", callback_data='role_manual')],
+        [InlineKeyboardButton("Сменить ФИ/РТП", callback_data='change_info')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Выберите роль:", reply_markup=reply_markup)
-
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -30,53 +32,86 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     await query.answer()
 
+    if data == 'return_to_menu':
+        del user_states[user_id]
+        keyboard = [
+            [InlineKeyboardButton("Отчет МКК", callback_data='role_mkk')],
+            [InlineKeyboardButton("Отчеты РТП", callback_data='role_rtp')],
+            [InlineKeyboardButton("Ручное заполнение", callback_data='role_manual')],
+            [InlineKeyboardButton("Сменить ФИ/РТП", callback_data='change_info')]
+        ]
+        await query.edit_message_text("Выберите роль:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
     if data.startswith('role_'):
         role = data.split('_')[1]
-        if role == 'manager' and user_id in config.ALLOWED_MANAGERS:
-            database.add_user(user_id, 'manager')
-            user_states[user_id] = {'mode': 'manager', 'step': 0, 'data': {}}
-            await show_manager_menu(query)
-        elif role == 'employee' and user_id in config.ALLOWED_EMPLOYEES:
-            database.add_user(user_id, 'employee')
-            user_states[user_id] = {'mode': 'employee', 'step': 0, 'data': {}, 'editing': False}
-            await start_filling(query, user_id)
-        elif role == 'manual':
-            user_states[user_id] = {'mode': 'manual', 'step': 0, 'data': {}, 'editing': False}
-            await start_filling(query, user_id)
-        else:
-            await query.edit_message_text("Вашего ID не обнаружено. Доступно только ручное заполнение.")
-            user_states[user_id] = {'mode': 'manual', 'step': 0, 'data': {}, 'editing': False}
-            await start_filling(query, user_id)
+        user_states[user_id] = {'mode': role, 'step': 0, 'data': {}, 'editing': False}
+        await handle_role_selection(query, user_id, role)
 
-    elif data == 'manager_show_reports':
-        # Показать отчеты на дату (список сотрудников с галочками)
+    elif data.startswith('choose_rtp_'):
+        index = int(data.split('_')[2])
+        selected_rtp_fi = config.RTP_LIST[index]
+        role = user_states[user_id]['mode']
+        if role == 'rtp':
+            name = selected_rtp_fi
+            database.add_user(user_id, 'manager', name)
+            del user_states[user_id]['choosing_rtp']
+            await query.edit_message_text(f"Выбрано ФИ: {name}. Показываем меню.", reply_markup=main_inline_keyboard)
+            await show_manager_menu(query)
+        else:
+            name = user_states[user_id]['name']
+            database.add_user(user_id, 'employee', name, selected_rtp_fi)
+            del user_states[user_id]['choosing_rtp']
+            del user_states[user_id]['name']
+            await query.edit_message_text(f"Привязка к {selected_rtp_fi} успешна. Начинаем отчёт.", reply_markup=main_inline_keyboard)
+            user_states[user_id]['step'] = 0
+            user_states[user_id]['data'] = {}
+            user_states[user_id]['editing'] = False
+            await ask_next_question(query.message, user_id)
+
+    elif data == 'change_info':
+        role = user_states.get(user_id, {}).get('mode', 'manual')
+        database.set_user_name(user_id, None)
+        if role == 'mkk':
+            database.set_manager_fi_for_employee(user_id, None)
+        user_states[user_id] = {'mode': role, 'entering_name': True}
+        if role == 'rtp':
+            await show_rtp_buttons(query, "Выберите ваше ФИ из списка:")
+        else:
+            await query.edit_message_text("Данные сброшены. Введите новое имя:", reply_markup=main_inline_keyboard)
+            await query.message.reply_text("Пожалуйста, введите ваше имя (для фиксации в системе):", reply_markup=main_inline_keyboard)
+
+    elif data == 'rtp_show_reports':
         today = datetime.now().strftime('%Y-%m-%d')
-        employees = database.get_employees()
+        manager_fi = database.get_user_name(user_id)
+        employees = database.get_employees(manager_fi)
         text = f"Отчеты на {today}:\n"
-        reports = database.get_all_reports_on_date(today)
+        reports = database.get_all_reports_on_date(today, manager_fi)
         reported_ids = [uid for uid, _ in reports]
-        for emp in employees:
-            status = '✅' if emp in reported_ids else ' '
-            text += f"Сотрудник {emp}: {status}\n"
+        for uid, name in employees:
+            status = '✅' if uid in reported_ids else ' '
+            display_name = name or uid
+            text += f"Сотрудник {display_name}: {status}\n"
         keyboard = [[InlineKeyboardButton("Выбрать другую дату", callback_data='select_date_show')]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-    elif data == 'manager_detailed_reports':
-        # Детальный отчет на дату
+    elif data == 'rtp_detailed_reports':
         today = datetime.now().strftime('%Y-%m-%d')
-        reports = database.get_all_reports_on_date(today)
+        manager_fi = database.get_user_name(user_id)
+        reports = database.get_all_reports_on_date(today, manager_fi)
         text = f"Детальные отчеты на {today}:\n"
         for uid, rdata in reports:
-            text += f"Сотрудник {uid}:\n{config.format_report(rdata)}\n\n"
+            name = database.get_user_name(uid) or uid
+            text += f"Сотрудник {name}:\n{config.format_report(rdata)}\n\n"
         keyboard = [[InlineKeyboardButton("Выбрать другую дату", callback_data='select_date_detailed')]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-    elif data == 'manager_combine_reports':
-        # Объединенный отчет
+    elif data == 'rtp_combine_reports':
         today = datetime.now().strftime('%Y-%m-%d')
-        reports = database.get_all_reports_on_date(today)
+        manager_fi = database.get_user_name(user_id)
+        reports = database.get_all_reports_on_date(today, manager_fi)
         if not reports:
-            await query.edit_message_text("Нет отчетов на сегодня.")
+            await query.edit_message_text("Нет отчетов на сегодня.", reply_markup=main_inline_keyboard)
             return
         combined = {}
         stars = []
@@ -94,7 +129,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 inn = rdata.get(f'ckp_{i}_inn', '')
                 product = rdata.get(f'ckp_{i}_product', '')
                 ckps.append(f"ИНН {inn} - {product}")
-
         combined['stars_count'] = len(stars)
         combined['ckp_realized'] = len(ckps)
         text = config.format_report(combined)
@@ -107,79 +141,136 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data == 'edit_report':
-        # Инициализируем состояние, если его нет
         if user_id not in user_states:
-            role = database.get_user_role(user_id) or 'manual'  # Для manual роли нет в БД
+            role = database.get_user_role(user_id) or 'manual'
             user_states[user_id] = {'mode': role, 'step': 0, 'data': {}, 'editing': True}
         else:
             user_states[user_id]['editing'] = True
             user_states[user_id]['step'] = 0
-
-        # Загружаем данные из БД (для employee/manager) или пустые (для manual)
         report_date = datetime.now().strftime('%Y-%m-%d')
         report_data = database.get_report(user_id, report_date) or {}
         user_states[user_id]['data'] = report_data
-
-        await start_filling(query, user_id, editing=True)
+        await query.edit_message_text("Начинаем редактирование.", reply_markup=main_inline_keyboard)
+        await ask_next_question(query.message, user_id)
 
     elif data == 'send_report':
-        # Отправка отчёта руководителям (для employee)
         report_date = datetime.now().strftime('%Y-%m-%d')
         data = database.get_report(user_id, report_date)
         if data:
             formatted = config.format_report(data)
-            for manager_id in config.ALLOWED_MANAGERS:
-                try:
-                    await context.bot.send_message(chat_id=manager_id,
-                                                   text=f"Отчёт от сотрудника {user_id} на {report_date}:\n{formatted}")
-                except Exception as e:
-                    print(f"Ошибка отправки менеджеру {manager_id}: {e}")  # Лог для отладки
-            await query.edit_message_text("Отчёт отправлен руководителю.")
+            name = database.get_user_name(user_id) or user_id
+            manager_fi = database.get_manager_fi_for_employee(user_id)
+            print(f"DEBUG: Sending report from {name}, manager_fi: {manager_fi}")
+            if manager_fi:
+                manager_id = database.get_manager_id_by_fi(manager_fi)
+                print(f"DEBUG: Manager ID for {manager_fi}: {manager_id}")
+                if manager_id:
+                    try:
+                        await context.bot.send_message(chat_id=manager_id, text=f"Отчёт от сотрудника {name} на {report_date}:\n{formatted}")
+                        await query.edit_message_text("Отчёт отправлен руководителю.", reply_markup=main_inline_keyboard)
+                    except Exception as e:
+                        print(f"Ошибка отправки менеджеру {manager_fi}: {e}")
+                        await query.edit_message_text("Ошибка отправки отчёта.", reply_markup=main_inline_keyboard)
+                else:
+                    await query.edit_message_text(f"Руководитель {manager_fi} не найден в системе.", reply_markup=main_inline_keyboard)
+            else:
+                await query.edit_message_text("Руководитель не привязан.", reply_markup=main_inline_keyboard)
         else:
-            await query.edit_message_text("Ошибка: отчёт не найден.")
+            await query.edit_message_text("Ошибка: отчёт не найден.", reply_markup=main_inline_keyboard)
 
     elif data == 'edit_combined':
-        # Заглушка для редактирования объединённого отчёта (если нужно реализовать - добавьте логику суммирования)
-        await query.edit_message_text("Редактирование объединённого отчёта пока не поддерживается.")
+        await query.edit_message_text("Редактирование объединённого отчёта пока не поддерживается.", reply_markup=main_inline_keyboard)
 
     elif data.startswith('select_date_'):
         mode = data.split('_')[2]
-        await query.edit_message_text("Введите дату (YYYY-MM-DD):")
+        await query.edit_message_text("Введите дату (YYYY-MM-DD):", reply_markup=main_inline_keyboard)
         user_states[user_id]['select_mode'] = mode
 
+async def handle_role_selection(query, user_id, role):
+    name = database.get_user_name(user_id)
+    print(f"DEBUG: Проверка имени для user_id {user_id}: {name}")
+    if role == 'rtp':
+        user_states[user_id] = {'mode': role, 'choosing_rtp': True}
+        await show_rtp_buttons(query, "Выберите ваше ФИ из списка:")
+    elif name and role == 'mkk':
+        manager_fi = database.get_manager_fi_for_employee(user_id)
+        if manager_fi:
+            print(f"DEBUG: Имя найдено: {name}, manager_fi: {manager_fi}")
+            user_states[user_id] = {'mode': role, 'step': 0, 'data': {}}
+            await query.edit_message_text("Роль выбрана.", reply_markup=main_inline_keyboard)
+            await start_filling(query, user_id)
+        else:
+            user_states[user_id] = {'mode': role, 'choosing_rtp': True, 'name': name}
+            await show_rtp_buttons(query, "Выберите вашего РТП:")
+    else:
+        user_states[user_id] = {'mode': role, 'entering_name': True}
+        await query.edit_message_text("Роль выбрана.", reply_markup=main_inline_keyboard)
+        await query.message.reply_text("Пожалуйста, введите ваше имя (для фиксации в системе):", reply_markup=main_inline_keyboard)
+
+async def show_rtp_buttons(query, text):
+    if not config.RTP_LIST:
+        await query.message.reply_text("Список РТП не настроен. Обратитесь к администратору.", reply_markup=main_inline_keyboard)
+        return
+    keyboard = [[InlineKeyboardButton(fi, callback_data=f"choose_rtp_{i}")] for i, fi in enumerate(config.RTP_LIST)]
+    await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     text = update.message.text.strip()
     state = user_states.get(user_id, {})
     if not state:
+        if text == "Вернуться в меню":
+            await start(update, context)
+            return
         await update.message.reply_text("Сессия истекла. Начните заново с /start.")
         return
 
+    if text == "Вернуться в меню":
+        del user_states[user_id]
+        await start(update, context)
+        return
+
+    if 'entering_name' in state and state['entering_name']:
+        name = text
+        role = state['mode']
+        state['name'] = name
+        del state['entering_name']
+        if role == 'mkk':
+            state['choosing_rtp'] = True
+            await show_rtp_buttons(update, "Выберите вашего РТП:")
+        else:
+            await update.message.reply_text("Пожалуйста, выберите ваше ФИ из списка кнопок.", reply_markup=main_inline_keyboard)
+        return
+
+    if 'choosing_rtp' in state and state['choosing_rtp']:
+        await update.message.reply_text("Пожалуйста, выберите РТП из списка кнопок.", reply_markup=main_inline_keyboard)
+        return
+
     if 'select_mode' in state:
-        # Обработка ввода даты
         try:
             date = datetime.strptime(text, '%Y-%m-%d').strftime('%Y-%m-%d')
+            manager_fi = database.get_user_name(user_id) if state['mode'] == 'rtp' else None
             if state['select_mode'] == 'show':
-                # Аналогично manager_show_reports, но на date
-                employees = database.get_employees()
+                employees = database.get_employees(manager_fi)
                 text_out = f"Отчеты на {date}:\n"
-                reports = database.get_all_reports_on_date(date)
+                reports = database.get_all_reports_on_date(date, manager_fi)
                 reported_ids = [uid for uid, _ in reports]
-                for emp in employees:
-                    status = '✅' if emp in reported_ids else ' '
-                    text_out += f"Сотрудник {emp}: {status}\n"
-                await update.message.reply_text(text_out)
+                for uid, name in employees:
+                    status = '✅' if uid in reported_ids else ' '
+                    display_name = name or uid
+                    text_out += f"Сотрудник {display_name}: {status}\n"
+                await update.message.reply_text(text_out, reply_markup=main_inline_keyboard)
             elif state['select_mode'] == 'detailed':
-                reports = database.get_all_reports_on_date(date)
+                reports = database.get_all_reports_on_date(date, manager_fi)
                 text_out = f"Детальные отчеты на {date}:\n"
                 for uid, rdata in reports:
-                    text_out += f"Сотрудник {uid}:\n{config.format_report(rdata)}\n\n"
-                await update.message.reply_text(text_out)
+                    name = database.get_user_name(uid) or uid
+                    text_out += f"Сотрудник {name}:\n{config.format_report(rdata)}\n\n"
+                await update.message.reply_text(text_out, reply_markup=main_inline_keyboard)
             elif state['select_mode'] == 'combine':
-                reports = database.get_all_reports_on_date(date)
+                reports = database.get_all_reports_on_date(date, manager_fi)
                 if not reports:
-                    await update.message.reply_text("Нет отчетов на эту дату.")
+                    await update.message.reply_text("Нет отчетов на эту дату.", reply_markup=main_inline_keyboard)
                     return
                 combined = {}
                 stars = []
@@ -197,7 +288,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         inn = rdata.get(f'ckp_{i}_inn', '')
                         product = rdata.get(f'ckp_{i}_product', '')
                         ckps.append(f"ИНН {inn} - {product}")
-
                 combined['stars_count'] = len(stars)
                 combined['ckp_realized'] = len(ckps)
                 text_out = config.format_report(combined)
@@ -207,7 +297,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(text_out, reply_markup=InlineKeyboardMarkup(keyboard))
             del user_states[user_id]['select_mode']
         except ValueError:
-            await update.message.reply_text("Неверный формат даты. Попробуйте снова (YYYY-MM-DD).")
+            await update.message.reply_text("Неверный формат даты. Попробуйте снова (YYYY-MM-DD).", reply_markup=main_inline_keyboard)
         return
 
     if 'step' not in state:
@@ -220,63 +310,56 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state['step'] += 1
         await ask_next_question(update.message, user_id)
     else:
-        # Динамические вопросы для звезд и ЦКП
         if 'stars_left' in state and state['stars_left'] > 0:
             if 'current_star_inn' not in state:
                 state['data'][f'star_{state["stars_count"] - state["stars_left"]}_inn'] = text
                 state['current_star_inn'] = True
-                await update.message.reply_text("Комментарий (За счет чего звезда, премьер или расширение и т.д.):")
+                await update.message.reply_text("Комментарий (За счет чего звезда, премьер или расширение и т.д.):", reply_markup=main_inline_keyboard)
             else:
                 state['data'][f'star_{state["stars_count"] - state["stars_left"]}_comment'] = text
                 state['stars_left'] -= 1
                 del state['current_star_inn']
                 if state['stars_left'] > 0:
-                    await update.message.reply_text(
-                        f"ИНН организации для звезды {state['stars_count'] - state['stars_left'] + 1}:")
+                    await update.message.reply_text(f"ИНН организации для звезды {state['stars_count'] - state['stars_left'] + 1}:", reply_markup=main_inline_keyboard)
                 else:
                     await ask_ckp_questions(update.message, user_id)
         elif 'ckp_left' in state and state['ckp_left'] > 0:
             if 'current_ckp_inn' not in state:
                 state['data'][f'ckp_{state["ckp_realized"] - state["ckp_left"]}_inn'] = text
                 state['current_ckp_inn'] = True
-                await update.message.reply_text("Что за продукт:")
+                await update.message.reply_text("Что за продукт:", reply_markup=main_inline_keyboard)
             else:
                 state['data'][f'ckp_{state["ckp_realized"] - state["ckp_left"]}_comment'] = text
                 state['ckp_left'] -= 1
                 del state['current_ckp_inn']
                 if state['ckp_left'] > 0:
-                    await update.message.reply_text(
-                        f"ИНН организации для ЦКП {state['ckp_realized'] - state['ckp_left'] + 1}:")
+                    await update.message.reply_text(f"ИНН организации для ЦКП {state['ckp_realized'] - state['ckp_left'] + 1}:", reply_markup=main_inline_keyboard)
                 else:
                     await finish_report(update.message, user_id)
-
 
 async def start_filling(query, user_id, editing=False):
     state = user_states[user_id]
     if editing:
-        await query.edit_message_text("Редактирование отчета. Ответьте на вопросы заново (текущие значения показаны).")
+        await query.edit_message_text("Редактирование отчета. Ответьте на вопросы заново (текущие значения показаны).", reply_markup=main_inline_keyboard)
     else:
-        await query.edit_message_text("Начинаем заполнение отчета.")
+        await query.edit_message_text("Начинаем заполнение отчета.", reply_markup=main_inline_keyboard)
     await ask_next_question(query.message, user_id)
-
 
 async def ask_next_question(message, user_id):
     state = user_states[user_id]
     step = state['step']
     if step < len(config.QUESTIONS):
         q = config.QUESTIONS[step]
-        current_value = state['data'].get(q['key'], '') if state['editing'] else ''
-        await message.reply_text(f"{q['question']} {f'(текущее: {current_value})' if current_value else ''}")
+        current_value = state['data'].get(q['key'], '') if state.get('editing', False) else ''
+        await message.reply_text(f"{q['question']} {f'(текущее: {current_value})' if current_value else ''}", reply_markup=main_inline_keyboard)
     else:
-        # После базовых вопросов - динамика для звезд
         stars_count = int(state['data'].get('stars_count', 0))
         if stars_count > 0:
             state['stars_left'] = stars_count
-            state['stars_count'] = stars_count  # Для подсчета
-            await message.reply_text("ИНН организации для звезды 1:")
+            state['stars_count'] = stars_count
+            await message.reply_text("ИНН организации для звезды 1:", reply_markup=main_inline_keyboard)
         else:
             await ask_ckp_questions(message, user_id)
-
 
 async def ask_ckp_questions(message, user_id):
     state = user_states[user_id]
@@ -284,39 +367,41 @@ async def ask_ckp_questions(message, user_id):
     if ckp_count > 0:
         state['ckp_left'] = ckp_count
         state['ckp_realized'] = ckp_count
-        await message.reply_text("ИНН организации для ЦКП 1:")
+        await message.reply_text("ИНН организации для ЦКП 1:", reply_markup=main_inline_keyboard)
     else:
         await finish_report(message, user_id)
-
 
 async def finish_report(message, user_id):
     state = user_states[user_id]
     data = state['data']
     formatted = config.format_report(data)
-    await message.reply_text(f"Итоговый отчет:\n{formatted}")
-
-    keyboard = [[InlineKeyboardButton("Редактировать", callback_data='edit_report')]]
-    if state['mode'] == 'employee':
-        keyboard[0].append(InlineKeyboardButton("Отправить руководителю", callback_data='send_report'))
+    await message.reply_text(f"Итоговый отчет:\n{formatted}", reply_markup=main_inline_keyboard)
+    keyboard = [
+        [InlineKeyboardButton("Редактировать", callback_data='edit_report')],
+        [InlineKeyboardButton("Сменить ФИ/РТП", callback_data='change_info')]
+    ]
+    if state['mode'] == 'mkk':
+        keyboard[0].insert(1, InlineKeyboardButton("Отправить руководителю", callback_data='send_report'))
     await message.reply_text("Действия:", reply_markup=InlineKeyboardMarkup(keyboard))
-
     if state['mode'] != 'manual':
         database.save_report(user_id, data)
-    # del user_states[user_id]  # Не удаляем, чтобы состояние сохранилось для редактирования
-
 
 async def show_manager_menu(query):
     keyboard = [
-        [InlineKeyboardButton("Показать отчеты на дату", callback_data='manager_show_reports')],
-        [InlineKeyboardButton("Детальный отчет на дату", callback_data='manager_detailed_reports')],
-        [InlineKeyboardButton("Объединить и показать отчеты на дату", callback_data='manager_combine_reports')]
+        [InlineKeyboardButton("Показать отчеты на дату", callback_data='rtp_show_reports')],
+        [InlineKeyboardButton("Детальный отчет на дату", callback_data='rtp_detailed_reports')],
+        [InlineKeyboardButton("Объединить и показать отчеты на дату", callback_data='rtp_combine_reports')],
+        [InlineKeyboardButton("Сменить ФИ", callback_data='change_info')]
     ]
     await query.edit_message_text("Меню руководителя:", reply_markup=InlineKeyboardMarkup(keyboard))
 
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Update {update} caused error {context.error}")
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_error_handler(error_handler)
     app.run_polling()
