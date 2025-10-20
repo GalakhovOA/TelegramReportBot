@@ -136,46 +136,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "\nЦКП: " + ", ".join(ckps)
         keyboard = [
             [InlineKeyboardButton("Редактировать", callback_data='edit_combined')],
-            [InlineKeyboardButton("Выбрать другую дату", callback_data='select_date_combine')],
-            [InlineKeyboardButton("Отправить РМ/МН", callback_data='send_to_rm_mn')]
+            [InlineKeyboardButton("Выбрать другую дату", callback_data='select_date_combine')]
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-    elif data == 'send_to_rm_mn':
-        report_date = datetime.now().strftime('%Y-%m-%d')
-        manager_fi = database.get_user_name(user_id)
-        reports = database.get_all_reports_on_date(report_date, manager_fi)
-        if not reports:
-            await query.edit_message_text("Нет отчётов для отправки.", reply_markup=main_inline_keyboard)
-            return
-        combined = {}
-        stars = []
-        ckps = []
-        for _, rdata in reports:
-            for key in rdata:
-                if key.startswith('star_') or key.startswith('ckp_'):
-                    continue
-                combined[key] = combined.get(key, 0) + int(rdata.get(key, 0))
-            for i in range(int(rdata.get('stars_count', 0))):
-                inn = rdata.get(f'star_{i}_inn', '')
-                comment = rdata.get(f'star_{i}_comment', '')
-                stars.append(f"ИНН {inn} - {comment}")
-            for i in range(int(rdata.get('ckp_realized', 0))):
-                inn = rdata.get(f'ckp_{i}_inn', '')
-                product = rdata.get(f'ckp_{i}_product', '')
-                ckps.append(f"ИНН {inn} - {product}")
-        combined['stars_count'] = len(stars)
-        combined['ckp_realized'] = len(ckps)
-        formatted = config.format_report(combined)
-        formatted += "\nЗвезды: " + ", ".join(stars)
-        formatted += "\nЦКП: " + ", ".join(ckps)
-        name = database.get_user_name(user_id) or user_id
-        for rm_mn_id in config.RM_MN_IDS:
-            try:
-                await context.bot.send_message(chat_id=rm_mn_id, text=f"Объединённый отчёт от РТП {name} на {report_date}:\n{formatted}")
-            except Exception as e:
-                print(f"Ошибка отправки РМ/МН {rm_mn_id}: {e}")
-        await query.edit_message_text("Отчёт отправлен РМ/МН.", reply_markup=main_inline_keyboard)
 
     elif data == 'edit_report':
         if user_id not in user_states:
