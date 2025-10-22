@@ -20,7 +20,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             report_date TEXT,
-            report_data TEXT
+            report_data TEXT  -- JSON
         )
     ''')
     conn.commit()
@@ -30,14 +30,11 @@ def add_user(user_id, role, name=None, manager_fi=None):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     if name and manager_fi:
-        cursor.execute('INSERT OR REPLACE INTO users (user_id, role, name, manager_fi) VALUES (?, ?, ?, ?)',
-                      (user_id, role, name, manager_fi))
+        cursor.execute('INSERT OR REPLACE INTO users (user_id, role, name, manager_fi) VALUES (?, ?, ?, ?)', (user_id, role, name, manager_fi))
     elif name:
-        cursor.execute('INSERT OR REPLACE INTO users (user_id, role, name) VALUES (?, ?, ?)',
-                      (user_id, role, name))
+        cursor.execute('INSERT OR REPLACE INTO users (user_id, role, name) VALUES (?, ?, ?)', (user_id, role, name))
     else:
-        cursor.execute('INSERT OR REPLACE INTO users (user_id, role) VALUES (?, ?)',
-                      (user_id, role))
+        cursor.execute('INSERT OR REPLACE INTO users (user_id, role) VALUES (?, ?)', (user_id, role))
     conn.commit()
     conn.close()
 
