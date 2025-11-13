@@ -83,3 +83,4 @@ def format_report(data):
         report += f"  ИНН {inn} - {product}\n"
 
     return report
+
