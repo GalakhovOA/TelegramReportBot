@@ -1,8 +1,10 @@
+# database.py
 import sqlite3
 from datetime import datetime
 import json
+import os
 
-DB_FILE = 'reports.db'
+DB_FILE = os.path.join(os.path.dirname(__file__), 'reports.db')
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -10,9 +12,9 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            role TEXT NOT NULL,  -- 'employee' or 'manager'
-            name TEXT,  -- ФИ пользователя
-            manager_fi TEXT  -- ФИ руководителя для сотрудников
+            role TEXT NOT NULL,
+            name TEXT,
+            manager_fi TEXT
         )
     ''')
     cursor.execute('''
@@ -29,15 +31,9 @@ def init_db():
 def add_user(user_id, role, name=None, manager_fi=None):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    if name and manager_fi:
-        cursor.execute('INSERT OR REPLACE INTO users (user_id, role, name, manager_fi) VALUES (?, ?, ?, ?)',
-                      (user_id, role, name, manager_fi))
-    elif name:
-        cursor.execute('INSERT OR REPLACE INTO users (user_id, role, name) VALUES (?, ?, ?)',
-                      (user_id, role, name))
-    else:
-        cursor.execute('INSERT OR REPLACE INTO users (user_id, role) VALUES (?, ?)',
-                      (user_id, role))
+    # INSERT OR REPLACE to keep row by user_id
+    cursor.execute('INSERT OR REPLACE INTO users (user_id, role, name, manager_fi) VALUES (?, ?, ?, ?)',
+                   (user_id, role, name, manager_fi))
     conn.commit()
     conn.close()
 
@@ -45,17 +41,17 @@ def get_user_role(user_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('SELECT role FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
+    r = cursor.fetchone()
     conn.close()
-    return result[0] if result else None
+    return r[0] if r else None
 
 def get_user_name(user_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('SELECT name FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
+    r = cursor.fetchone()
     conn.close()
-    return result[0] if result else None
+    return r[0] if r else None
 
 def set_user_name(user_id, name):
     conn = sqlite3.connect(DB_FILE)
@@ -68,9 +64,9 @@ def get_manager_fi_for_employee(user_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('SELECT manager_fi FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
+    r = cursor.fetchone()
     conn.close()
-    return result[0] if result else None
+    return r[0] if r else None
 
 def set_manager_fi_for_employee(user_id, manager_fi):
     conn = sqlite3.connect(DB_FILE)
@@ -83,16 +79,17 @@ def get_manager_id_by_fi(manager_fi):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('SELECT user_id FROM users WHERE role = "manager" AND name = ?', (manager_fi,))
-    result = cursor.fetchone()
+    r = cursor.fetchone()
     conn.close()
-    return result[0] if result else None
+    return r[0] if r else None
 
-def save_report(user_id, report_data):
-    date = datetime.now().strftime('%Y-%m-%d')
+def save_report(user_id, report_data, date=None):
+    if date is None:
+        date = datetime.now().strftime('%Y-%m-%d')
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('INSERT INTO reports (user_id, report_date, report_data) VALUES (?, ?, ?)',
-                  (user_id, date, json.dumps(report_data)))
+                   (user_id, date, json.dumps(report_data, ensure_ascii=False)))
     conn.commit()
     conn.close()
 
@@ -100,11 +97,15 @@ def get_report(user_id, date):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('SELECT report_data FROM reports WHERE user_id = ? AND report_date = ?', (user_id, date))
-    result = cursor.fetchone()
+    r = cursor.fetchone()
     conn.close()
-    return json.loads(result[0]) if result else None
+    return json.loads(r[0]) if r else None
 
 def get_all_reports_on_date(date, manager_fi=None):
+    """
+    Возвращает список (user_id, report_data_dict) за date.
+    Если manager_fi задан — только для сотрудников с manager_fi.
+    """
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     if manager_fi:
@@ -116,9 +117,9 @@ def get_all_reports_on_date(date, manager_fi=None):
         ''', (date, manager_fi))
     else:
         cursor.execute('SELECT user_id, report_data FROM reports WHERE report_date = ?', (date,))
-    results = cursor.fetchall()
+    rows = cursor.fetchall()
     conn.close()
-    return [(uid, json.loads(data)) for uid, data in results]
+    return [(uid, json.loads(data)) for uid, data in rows]
 
 def get_employees(manager_fi=None):
     conn = sqlite3.connect(DB_FILE)
@@ -127,9 +128,9 @@ def get_employees(manager_fi=None):
         cursor.execute("SELECT user_id, name FROM users WHERE role = 'employee' AND manager_fi = ?", (manager_fi,))
     else:
         cursor.execute("SELECT user_id, name FROM users WHERE role = 'employee'")
-    results = cursor.fetchall()
+    rows = cursor.fetchall()
     conn.close()
-    return results
+    return rows
 
+# инициализация при импорте
 init_db()
-
