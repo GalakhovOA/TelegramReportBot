@@ -745,3 +745,4 @@ if __name__ == '__main__':
     asyncio.get_event_loop().run_until_complete(set_commands(app))
     print("Bot started")
     app.run_polling()
+
