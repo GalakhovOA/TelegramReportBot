@@ -13,7 +13,7 @@ from telegram.ext import (
 import config
 import database
 
-# --- load .env ---
+# load .env
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOTENV_PATH = os.path.join(BASE_DIR, '.env')
 if os.path.exists(DOTENV_PATH):
@@ -25,18 +25,17 @@ TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     print("ERROR: BOT_TOKEN not found in environment. Put it to .env or env variable BOT_TOKEN")
 
-# --- Runtime state (in-memory) ---
-# structure: {user_id: {'mode': 'manual/mkk/rtp', 'step': int, 'data': {}, 'editing': bool, ...}}
+# in-memory runtime state
+# { user_id: {mode:'manual'/'mkk'/'rtp', step:int, data:dict, editing:bool, ...} }
 user_states = {}
 
-def safe_state(user_id):
-    st = user_states.get(user_id)
-    if st is None:
+def safe_state(uid):
+    st = user_states.get(uid)
+    if not st:
         st = {'mode': 'manual', 'step': 0, 'data': {}, 'editing': False}
-        user_states[user_id] = st
+        user_states[uid] = st
     return st
 
-# --- Helpers ---
 def build_main_menu():
     keyboard = [
         [InlineKeyboardButton("Отчет МКК", callback_data='role_mkk')],
@@ -46,86 +45,86 @@ def build_main_menu():
     ]
     return InlineKeyboardMarkup(keyboard)
 
+# /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.effective_message
     await msg.reply_text("Выберите роль:", reply_markup=build_main_menu())
 
-# Callback: общая обработка нажатий кнопок
+# общий обработчик callback'ов
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
-    user_id = query.from_user.id
-    data = query.data
+    uid = query.from_user.id
+    data = query.data or ''
     await query.answer()
-    state = user_states.get(user_id, {})
+    st = user_states.get(uid, {})
 
-    # return to menu
+    # возвращение в меню
     if data == 'return_to_menu':
-        user_states.pop(user_id, None)
+        user_states.pop(uid, None)
         await query.edit_message_text("Выберите роль:", reply_markup=build_main_menu())
         return
 
-    # role selection
+    # выбор роли
     if data.startswith('role_'):
-        role = data.split('_', 1)[1]
-        user_states[user_id] = {'mode': role, 'step': 0, 'data': {}, 'editing': False}
-        await handle_role_selection(query, user_id, role)
+        role = data.split('_',1)[1]
+        user_states[uid] = {'mode': role, 'step': 0, 'data': {}, 'editing': False}
+        await handle_role_selection(query, uid, role)
         return
 
-    # choose rtp
+    # выбор РТП из списка
     if data.startswith('choose_rtp_'):
         try:
-            index = int(data.split('_')[2])
+            idx = int(data.split('_')[2])
         except Exception:
             await query.edit_message_text("Ошибка выбора. Попробуйте снова.")
             return
-        if index < 0 or index >= len(config.RTP_LIST):
+        if idx < 0 or idx >= len(config.RTP_LIST):
             await query.edit_message_text("Ошибка: некорректный индекс РТП.")
             return
-        selected = config.RTP_LIST[index]
-        role = state.get('mode', 'manual')
+        selected = config.RTP_LIST[idx]
+        role = st.get('mode','manual')
 
         if role == 'rtp':
-            # set as manager with selected FI
             try:
-                database.add_user(user_id, 'manager', selected)
+                database.add_user(uid, 'manager', selected)
             except Exception as e:
                 print("DB add_user error:", e)
-            state.pop('choosing_rtp', None)
+            st.pop('choosing_rtp', None)
             await query.edit_message_text(f"Выбрано ФИ: {selected}. Показываем меню.")
             await show_manager_menu(query)
             return
 
-        # else employee linking
-        name = state.get('name')
+        # employee linking
+        name = st.get('name')
         if not name:
             await query.edit_message_text("Ошибка: имя не задано. Повторите ввод.")
             return
         try:
-            database.add_user(user_id, 'employee', name, selected)
+            database.add_user(uid, 'employee', name, selected)
         except Exception as e:
             print("DB add_user error:", e)
-        state.pop('choosing_rtp', None)
-        state.pop('name', None)
-        state.update({'step': 0, 'data': {}, 'editing': False})
+        st.pop('choosing_rtp', None)
+        st.pop('name', None)
+        st.update({'step': 0, 'data': {}, 'editing': False})
         await query.edit_message_text(f"Привязка к {selected} успешна. Начинаем отчёт.")
-        await ask_next_question(query.message, user_id)
+        await ask_next_question(query.message, uid)
         return
 
-    # change info
+    # смена ФИ/РТП
     if data == 'change_info':
-        role = state.get('mode', 'manual')
+        role = st.get('mode','manual')
         try:
-            database.set_user_name(user_id, None)
+            database.set_user_name(uid, None)
         except Exception:
             pass
         if role == 'mkk':
             try:
-                database.set_manager_fi_for_employee(user_id, None)
+                database.set_manager_fi_for_employee(uid, None)
             except Exception:
                 pass
-        user_states[user_id] = {'mode': role, 'entering_name': True}
+        user_states[uid] = {'mode': role, 'entering_name': True}
         if role == 'rtp':
             await show_rtp_buttons(query, "Выберите ваше ФИ из списка:")
         else:
@@ -133,63 +132,54 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Пожалуйста, введите ваше имя (для фиксации в системе):")
         return
 
-    # manager actions: show reports
+    # РТП: показать отчеты
     if data == 'rtp_show_reports':
-        today = datetime.now().strftime('%Y-%m-%d')
-        manager_fi = database.get_user_name(user_id)
+        date = datetime.now().strftime('%Y-%m-%d')
+        manager_fi = database.get_user_name(uid)
         employees = database.get_employees(manager_fi)
-        text = f"Отчеты на {today}:\n"
-        reports = database.get_all_reports_on_date(today, manager_fi)
-        reported_ids = [uid for uid, _ in reports]
-        for uid, name in employees:
-            status = '✅' if uid in reported_ids else ' '
-            display_name = name or str(uid)
-            text += f"Сотрудник {display_name}: {status}\n"
-        keyboard = [[InlineKeyboardButton("Выбрать другую дату", callback_data='select_date_show')]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        reports = database.get_all_reports_on_date(date, manager_fi)
+        reported_ids = [u for u,_ in reports]
+        text = f"Отчеты на {date}:\n"
+        for u_eid, name in employees:
+            status = '✅' if u_eid in reported_ids else ' '
+            text += f"Сотрудник {name or str(u_eid)}: {status}\n"
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Выбрать другую дату", callback_data='select_date_show')]]))
         return
 
     if data == 'rtp_detailed_reports':
-        today = datetime.now().strftime('%Y-%m-%d')
-        manager_fi = database.get_user_name(user_id)
-        reports = database.get_all_reports_on_date(today, manager_fi)
-        text = f"Детальные отчеты на {today}:\n"
-        for uid, rdata in reports:
-            name = database.get_user_name(uid) or str(uid)
+        date = datetime.now().strftime('%Y-%m-%d')
+        manager_fi = database.get_user_name(uid)
+        reports = database.get_all_reports_on_date(date, manager_fi)
+        text = f"Детальные отчеты на {date}:\n"
+        for u_id, rdata in reports:
+            name = database.get_user_name(u_id) or str(u_id)
             text += f"Сотрудник {name}:\n{config.format_report(rdata)}\n\n"
-        keyboard = [[InlineKeyboardButton("Выбрать другую дату", callback_data='select_date_detailed')]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Выбрать другую дату", callback_data='select_date_detailed')]]))
         return
 
     if data == 'rtp_combine_reports':
-        today = datetime.now().strftime('%Y-%m-%d')
-        manager_fi = database.get_user_name(user_id)
-        reports = database.get_all_reports_on_date(today, manager_fi)
+        date = datetime.now().strftime('%Y-%m-%d')
+        manager_fi = database.get_user_name(uid)
+        reports = database.get_all_reports_on_date(date, manager_fi)
         if not reports:
             await query.edit_message_text("Нет отчетов на сегодня.")
             return
 
-        # combine numeric keys and collect fckp products
         combined = {}
         fckp_products = []
-        for _, rdata in reports:
-            for key, val in rdata.items():
-                if key == 'fckp_products':
-                    if isinstance(val, list):
-                        fckp_products.extend(val)
+        for _, r in reports:
+            for k, v in r.items():
+                if k == 'fckp_products' and isinstance(v, list):
+                    fckp_products.extend(v)
                 else:
                     try:
-                        combined[key] = combined.get(key, 0) + int(val or 0)
+                        combined[k] = combined.get(k, 0) + int(v or 0)
                     except Exception:
                         pass
-
         combined['fckp_products'] = fckp_products
-        # fckp_realized computed length
         combined['fckp_realized'] = len(fckp_products)
 
-        text = config.format_report(combined)
-        text += "\n\n" + config.OPERATIONAL_DEFECTS_BLOCK
-
+        text = config.format_report(combined) + "\n\n" + config.OPERATIONAL_DEFECTS_BLOCK
         keyboard = [
             [InlineKeyboardButton("Редактировать", callback_data='edit_combined')],
             [InlineKeyboardButton("Выбрать другую дату", callback_data='select_date_combine')],
@@ -199,129 +189,107 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == 'send_to_rm_mn':
-        report_date = datetime.now().strftime('%Y-%m-%d')
-        manager_fi = database.get_user_name(user_id)
-        reports = database.get_all_reports_on_date(report_date, manager_fi)
+        date = datetime.now().strftime('%Y-%m-%d')
+        manager_fi = database.get_user_name(uid)
+        reports = database.get_all_reports_on_date(date, manager_fi)
         if not reports:
             await query.edit_message_text("Нет отчётов для отправки.")
             return
-
-        # combine
         combined = {}
         fckp_products = []
-        for _, rdata in reports:
-            for key, val in rdata.items():
-                if key == 'fckp_products':
-                    if isinstance(val, list):
-                        fckp_products.extend(val)
+        for _, r in reports:
+            for k, v in r.items():
+                if k == 'fckp_products' and isinstance(v, list):
+                    fckp_products.extend(v)
                 else:
                     try:
-                        combined[key] = combined.get(key, 0) + int(val or 0)
+                        combined[k] = combined.get(k, 0) + int(v or 0)
                     except Exception:
                         pass
         combined['fckp_products'] = fckp_products
         combined['fckp_realized'] = len(fckp_products)
-
-        formatted = config.format_report(combined)
-        formatted += "\n\n" + config.OPERATIONAL_DEFECTS_BLOCK
-
-        name = database.get_user_name(user_id) or str(user_id)
-        for rm_mn_id in getattr(config, 'RM_MN_IDS', []):
+        formatted = config.format_report(combined) + "\n\n" + config.OPERATIONAL_DEFECTS_BLOCK
+        name = database.get_user_name(uid) or str(uid)
+        for rid in getattr(config, 'RM_MN_IDS', []):
             try:
-                await context.bot.send_message(chat_id=rm_mn_id,
-                                               text=f"Объединённый отчёт от РТП {name} на {report_date}:\n{formatted}")
+                await context.bot.send_message(chat_id=rid, text=f"Объединённый отчёт от РТП {name} на {date}:\n{formatted}")
             except Exception as e:
-                print(f"Ошибка отправки РМ/МН {rm_mn_id}: {e}")
+                print("Ошибка отправки RM/MN:", e)
         await query.edit_message_text("Отчёт отправлен РМ/МН.")
         return
 
+    # редактирование личного отчета
     if data == 'edit_report':
-        if user_id not in user_states:
-            role = database.get_user_role(user_id) or 'manual'
-            user_states[user_id] = {'mode': role, 'step': 0, 'data': {}, 'editing': True}
-        else:
-            user_states[user_id]['editing'] = True
-            user_states[user_id]['step'] = 0
-        report_date = datetime.now().strftime('%Y-%m-%d')
-        report_data = database.get_report(user_id, report_date) or {}
-        user_states[user_id]['data'] = report_data
+        # подготовка state для редактирования
+        role = database.get_user_role(uid) or 'manual'
+        user_states[uid] = {'mode': role, 'step': 0, 'data': {}, 'editing': True}
+        date = datetime.now().strftime('%Y-%m-%d')
+        rpt = database.get_report(uid, date) or {}
+        user_states[uid]['data'] = rpt
         await query.edit_message_text("Начинаем редактирование.")
-        await ask_next_question(query.message, user_id)
+        await ask_next_question(query.message, uid)
         return
 
+    # отправка руководителю (личный отчет)
     if data == 'send_report':
-        report_date = datetime.now().strftime('%Y-%m-%d')
-        data_report = database.get_report(user_id, report_date)
-        if data_report:
-            formatted = config.format_report(data_report)
-            name = database.get_user_name(user_id) or str(user_id)
-            manager_fi = database.get_manager_fi_for_employee(user_id)
-            if manager_fi:
-                manager_id = database.get_manager_id_by_fi(manager_fi)
-                if manager_id:
-                    try:
-                        await context.bot.send_message(chat_id=manager_id,
-                                                       text=f"Отчёт от сотрудника {name} на {report_date}:\n{formatted}")
-                        await query.edit_message_text("Отчёт отправлен руководителю.")
-                    except Exception as e:
-                        print(f"Ошибка отправки менеджеру {manager_fi}: {e}")
-                        await query.edit_message_text("Ошибка отправки отчёта.")
-                else:
-                    await query.edit_message_text(f"Руководитель {manager_fi} не найден в системе.")
-            else:
-                await query.edit_message_text("Руководитель не привязан.")
-        else:
+        date = datetime.now().strftime('%Y-%m-%d')
+        rpt = database.get_report(uid, date)
+        if not rpt:
             await query.edit_message_text("Ошибка: отчёт не найден.")
-        return
-
-    if data.startswith('select_date_'):
-        parts = data.split('_')
-        if len(parts) >= 3:
-            mode = parts[2]
-            await query.edit_message_text("Введите дату (YYYY-MM-DD):")
-            st = safe_state(user_id)
-            st['select_mode'] = mode
+            return
+        formatted = config.format_report(rpt)
+        name = database.get_user_name(uid) or str(uid)
+        manager_fi = database.get_manager_fi_for_employee(uid)
+        if manager_fi:
+            manager_id = database.get_manager_id_by_fi(manager_fi)
+            if manager_id:
+                try:
+                    await context.bot.send_message(chat_id=manager_id, text=f"Отчёт от сотрудника {name} на {date}:\n{formatted}")
+                    await query.edit_message_text("Отчёт отправлен руководителю.")
+                except Exception as e:
+                    print("Ошибка отправки руководителю:", e)
+                    await query.edit_message_text("Ошибка отправки отчёта.")
+            else:
+                await query.edit_message_text(f"Руководитель {manager_fi} не найден в системе.")
         else:
-            await query.edit_message_text("Ошибка выбора режима даты.")
+            await query.edit_message_text("Руководитель не привязан.")
         return
 
-    # FCKP product selection callbacks use prefix 'fckp_prod_...'
+    # выбор продукта ФЦКП (callback fckp_prod_<prod>)
     if data.startswith('fckp_prod_'):
-        # callback format: fckp_prod_<product>
-        prod = data.split('fckp_prod_', 1)[1]
-        st = safe_state(user_id)
-        # save product to state fckp_products
-        st.setdefault('fckp_products', []).append(prod)
+        prod = data.split('fckp_prod_',1)[1]
+        st = safe_state(uid)
+        st.setdefault('fckp_products', [])
+        st['fckp_products'].append(prod)
         st['fckp_left'] = st.get('fckp_left', 0) - 1
         left = st.get('fckp_left', 0)
         if left > 0:
-            # update message prompting next choice
             keyboard = [[InlineKeyboardButton(p, callback_data=f"fckp_prod_{p}")] for p in config.FCKP_OPTIONS]
             try:
-                await query.edit_message_text(f"Вы выбрали {prod}. Осталось указать ещё {left} ФЦКП.",
-                                              reply_markup=InlineKeyboardMarkup(keyboard))
+                await query.edit_message_text(f"Вы выбрали {prod}. Осталось указать ещё {left} ФЦКП.", reply_markup=InlineKeyboardMarkup(keyboard))
             except Exception:
                 pass
             return
         else:
-            # finished selecting
+            # финализируем выбор продуктов
             st['data']['fckp_products'] = st.get('fckp_products', [])
-            # ensure fckp_realized updated to length
-            st['data']['fckp_realized'] = len(st['fckp_products']) if st.get('fckp_products') else 0
+            st['data']['fckp_realized'] = len(st.get('fckp_products', []))
             try:
                 await query.edit_message_text("Все ФЦКП указаны ✅")
             except Exception:
                 pass
-            # continue to next question
-            st['step'] = st.get('step', 0) + 1
-            await ask_next_question(query.message, user_id)
+            # двигаемся дальше
+            st['step'] = st.get('step',0) + 1
+            await ask_next_question(query.message, uid)
             return
 
-# -------------------- Helpers for role selection and asking/questions --------------------
+    # непойманные callback'ы - игнор
+    # end button_handler
+    return
+
+# Helpers -------------------------------------------------
 
 async def handle_role_selection(query_or_update, user_id, role):
-    # query_or_update can be CallbackQuery or Update.Message
-    # get db stored name
     name = database.get_user_name(user_id)
     if role == 'rtp':
         user_states[user_id] = {'mode': role, 'choosing_rtp': True}
@@ -375,16 +343,16 @@ async def show_rtp_buttons(query_or_message, text):
         except Exception:
             pass
 
+# message handler (text messages)
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
-    user_id = msg.from_user.id
+    uid = msg.from_user.id
     text = (msg.text or "").strip()
-    state = user_states.get(user_id, {})
+    st = user_states.get(uid, {})
 
-    # sessionless
-    if not state:
+    if not st:
         if text.lower() == "вернуться в меню":
             await start(update, context)
             return
@@ -392,54 +360,53 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text.lower() == "вернуться в меню":
-        user_states.pop(user_id, None)
+        user_states.pop(uid, None)
         await start(update, context)
         return
 
-    # entering name (first time)
-    if state.get('entering_name'):
+    # ввод имени
+    if st.get('entering_name'):
         name = text
-        role = state.get('mode', 'manual')
-        state['name'] = name
-        state.pop('entering_name', None)
-        # store name in DB
+        role = st.get('mode', 'manual')
+        st['name'] = name
+        st.pop('entering_name', None)
         try:
-            database.add_user(user_id, 'employee' if role == 'mkk' else role, name)
+            # записываем в БД — роль employee если mkk
+            database.add_user(uid, 'employee' if role == 'mkk' else role, name)
         except Exception as e:
             print("DB add_user error:", e)
         if role == 'mkk':
-            state['choosing_rtp'] = True
+            st['choosing_rtp'] = True
             await show_rtp_buttons(update, "Выберите вашего РТП:")
         else:
             await msg.reply_text("Пожалуйста, выберите ваше ФИ из списка кнопок.")
         return
 
-    # user must choose rtp from buttons
-    if state.get('choosing_rtp'):
+    # если ожидается выбор РТП кнопками
+    if st.get('choosing_rtp'):
         await msg.reply_text("Пожалуйста, выберите РТП из списка кнопок.")
         return
 
-    # date selection handling (for manager choose date)
-    if 'select_mode' in state:
+    # выбор даты для РТП
+    if 'select_mode' in st:
         try:
             date = datetime.strptime(text, '%Y-%m-%d').strftime('%Y-%m-%d')
-            manager_fi = database.get_user_name(user_id) if state.get('mode') == 'rtp' else None
-            mode = state.pop('select_mode', None)
+            manager_fi = database.get_user_name(uid) if st.get('mode') == 'rtp' else None
+            mode = st.pop('select_mode', None)
             if mode == 'show':
                 employees = database.get_employees(manager_fi)
-                text_out = f"Отчеты на {date}:\n"
                 reports = database.get_all_reports_on_date(date, manager_fi)
-                reported_ids = [uid for uid, _ in reports]
-                for uid, name in employees:
-                    status = '✅' if uid in reported_ids else ' '
-                    display_name = name or str(uid)
-                    text_out += f"Сотрудник {display_name}: {status}\n"
+                reported_ids = [u for u,_ in reports]
+                text_out = f"Отчеты на {date}:\n"
+                for u_id, name in employees:
+                    status = '✅' if u_id in reported_ids else ' '
+                    text_out += f"Сотрудник {name or str(u_id)}: {status}\n"
                 await msg.reply_text(text_out)
             elif mode == 'detailed':
                 reports = database.get_all_reports_on_date(date, manager_fi)
                 text_out = f"Детальные отчеты на {date}:\n"
-                for uid, rdata in reports:
-                    name = database.get_user_name(uid) or str(uid)
+                for u_id, rdata in reports:
+                    name = database.get_user_name(u_id) or str(u_id)
                     text_out += f"Сотрудник {name}:\n{config.format_report(rdata)}\n\n"
                 await msg.reply_text(text_out)
             elif mode == 'combine':
@@ -449,91 +416,81 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 combined = {}
                 fckp_products = []
-                for _, rdata in reports:
-                    for key, val in rdata.items():
-                        if key == 'fckp_products':
-                            if isinstance(val, list):
-                                fckp_products.extend(val)
+                for _, r in reports:
+                    for k, v in r.items():
+                        if k == 'fckp_products' and isinstance(v, list):
+                            fckp_products.extend(v)
                         else:
                             try:
-                                combined[key] = combined.get(key, 0) + int(val or 0)
+                                combined[k] = combined.get(k, 0) + int(v or 0)
                             except Exception:
                                 pass
                 combined['fckp_products'] = fckp_products
                 combined['fckp_realized'] = len(fckp_products)
-                text_out = config.format_report(combined)
-                text_out += "\n\n" + config.OPERATIONAL_DEFECTS_BLOCK
-                await msg.reply_text(text_out)
+                out = config.format_report(combined) + "\n\n" + config.OPERATIONAL_DEFECTS_BLOCK
+                await msg.reply_text(out)
             return
         except ValueError:
             await msg.reply_text("Неверный формат даты. Попробуйте снова (YYYY-MM-DD).")
             return
 
-    # normal questionnaire handling for MKK
-    if 'step' not in state:
+    # основной опрос МКК
+    if 'step' not in st:
         return
 
-    step = state['step']
-    # still inside QUESTIONS range?
+    step = st['step']
     if step < len(config.QUESTIONS):
         q = config.QUESTIONS[step]
-        # require numeric input
         if not text.isdigit():
             await msg.reply_text("Пожалуйста, введите число (цифрами).")
             return
-        # store numeric (as int) except keep fckp for special flow
+        # special for fckp_realized
         if q['key'] == 'fckp_realized':
-            # fckp: we store and then initiate button flow
             n = int(text)
-            state['data'][q['key']] = n
+            st['data'][q['key']] = n
             if n > 0:
-                # prepare selection state
-                state['fckp_left'] = n
-                state['fckp_products'] = []
-                # build keyboard for product selection
+                st['fckp_left'] = n
+                st['fckp_products'] = []
                 keyboard = [[InlineKeyboardButton(p, callback_data=f"fckp_prod_{p}")] for p in config.FCKP_OPTIONS]
-                await msg.reply_text(f"Вы указали {n} ФЦКП. Выберите оформленный продукт (1/{n}):",
-                                     reply_markup=InlineKeyboardMarkup(keyboard))
-                # do not advance step here; product selection callbacks will manage decrement and step increment
+                await msg.reply_text(f"Вы указали {n} ФЦКП. Выберите оформленный продукт (1/{n}):", reply_markup=InlineKeyboardMarkup(keyboard))
+                # do NOT advance step here — advance after product selection finishes
                 return
             else:
-                # zero -> continue to next question
-                state['step'] += 1
-                await ask_next_question(msg, user_id)
+                st['step'] += 1
+                await ask_next_question(msg, uid)
                 return
         else:
-            state['data'][q['key']] = int(text)
-            state['step'] += 1
-            await ask_next_question(msg, user_id)
+            st['data'][q['key']] = int(text)
+            st['step'] += 1
+            await ask_next_question(msg, uid)
             return
     else:
-        # if beyond questions (should not normally happen)
         await msg.reply_text("Опрос завершён. Для возврата в меню нажмите 'Вернуться в меню' или /start.")
         return
 
-# Ask next question helper
-async def ask_next_question(message_or_query, user_id):
-    st = user_states.get(user_id, {})
+async def ask_next_question(msgobj, uid):
+    st = safe_state(uid)
     step = st.get('step', 0)
     if step < len(config.QUESTIONS):
         q = config.QUESTIONS[step]
-        current_value = st.get('data', {}).get(q['key'], '') if st.get('editing', False) else ''
+        current = st.get('data', {}).get(q['key'], '')
         try:
-            await message_or_query.reply_text(f"{q['question']} {f'(текущее: {current_value})' if current_value != '' else ''}")
+            await msgobj.reply_text(f"{q['question']} {f'(текущее: {current})' if current != '' else ''}")
         except Exception:
             try:
-                await message_or_query.message.reply_text(f"{q['question']} {f'(текущее: {current_value})' if current_value != '' else ''}")
+                await msgobj.message.reply_text(f"{q['question']} {f'(текущее: {current})' if current != '' else ''}")
             except Exception as e:
-                print("Failed to send question:", e)
+                print("ask_next_question error:", e)
     else:
-        # finished questions -> finalize
-        await finish_report(message_or_query, user_id)
+        await finish_report(msgobj, uid)
 
-async def start_filling(query_or_message, user_id, editing=False):
-    st = safe_state(user_id)
+async def start_filling(query_or_message, uid, editing=False):
+    st = safe_state(uid)
     st['editing'] = editing
     st['step'] = 0
-    st['data'] = st.get('data', {}) if editing else {}
+    # preserve existing data if editing
+    if not editing:
+        st['data'] = {}
     try:
         await query_or_message.edit_message_text("Начинаем заполнение отчёта.")
     except Exception:
@@ -541,74 +498,70 @@ async def start_filling(query_or_message, user_id, editing=False):
             await query_or_message.reply_text("Начинаем заполнение отчёта.")
         except Exception:
             pass
-    await ask_next_question(query_or_message, user_id)
+    await ask_next_question(query_or_message, uid)
 
-async def finish_report(message_or_query, user_id):
-    st = user_states.get(user_id, {})
+async def finish_report(msgobj, uid):
+    st = safe_state(uid)
     data = st.get('data', {}) or {}
-    # if fckp_products present in state but not saved into data (in case of flow)
+    # if product list was collected in state but not pushed to data
     if 'fckp_products' in st and st.get('fckp_products'):
         data['fckp_products'] = st.get('fckp_products')
         data['fckp_realized'] = len(st.get('fckp_products'))
-    # ensure numeric keys present (set default 0)
+    # ensure numeric defaults
     for q in config.QUESTIONS:
         data.setdefault(q['key'], 0)
-    # save to DB (non-manual modes)
+    # save to DB for non-manual roles
     try:
         if st.get('mode') != 'manual':
-            database.save_report(user_id, data)
+            database.save_report(uid, data)
     except Exception as e:
         print("DB save_report error:", e)
     formatted = config.format_report(data)
     try:
-        await message_or_query.reply_text(f"Итоговый отчет:\n{formatted}")
+        await msgobj.reply_text(f"Итоговый отчет:\n{formatted}")
     except Exception:
         try:
-            await message_or_query.message.reply_text(f"Итоговый отчет:\n{formatted}")
+            await msgobj.message.reply_text(f"Итоговый отчет:\n{formatted}")
         except Exception:
             pass
 
-    # actions keyboard
     keyboard = [
         [InlineKeyboardButton("Редактировать", callback_data='edit_report')],
         [InlineKeyboardButton("Сменить ФИ/РТП", callback_data='change_info')]
     ]
     if st.get('mode') == 'mkk':
-        # вставляем кнопку отправки руководителю
         keyboard[0].insert(1, InlineKeyboardButton("Отправить руководителю", callback_data='send_report'))
     try:
-        await message_or_query.reply_text("Действия:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await msgobj.reply_text("Действия:", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception:
         pass
 
-# show manager menu
-async def show_manager_menu(query_or_message):
+async def show_manager_menu(q):
     keyboard = [
         [InlineKeyboardButton("Показать отчеты на дату", callback_data='rtp_show_reports')],
         [InlineKeyboardButton("Детальный отчет на дату", callback_data='rtp_detailed_reports')],
         [InlineKeyboardButton("Объединить и показать отчеты на дату", callback_data='rtp_combine_reports')]
     ]
     try:
-        await query_or_message.edit_message_text("Меню руководителя:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await q.edit_message_text("Меню руководителя:", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception:
         try:
-            await query_or_message.message.reply_text("Меню руководителя:", reply_markup=InlineKeyboardMarkup(keyboard))
+            await q.message.reply_text("Меню руководителя:", reply_markup=InlineKeyboardMarkup(keyboard))
         except Exception:
             pass
 
 # error handler
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"Update {update} caused error {context.error}")
+    print("Error:", context.error)
 
-# set commands
+# set bot commands
 async def set_commands(app):
-    commands = [BotCommand("start", "Начать работу с ботом")]
     try:
-        await app.bot.set_my_commands(commands)
+        await app.bot.set_my_commands([BotCommand("start", "Начать работу с ботом")])
     except Exception as e:
-        print("Ошибка установки системных команд:", e)
+        print("set_commands error:", e)
 
-# --- Run ---
+# Run
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
 

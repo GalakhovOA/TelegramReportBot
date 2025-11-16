@@ -40,26 +40,25 @@ def format_report(data):
       - числовые поля (ключи из QUESTIONS)
       - 'fckp_products' : list of product strings
     """
-    def get(k, default=0):
-        v = data.get(k, default)
+    def get_int(k):
+        v = data.get(k, 0)
         try:
             return int(v)
         except Exception:
             try:
                 return int(float(v))
             except Exception:
-                return default
+                return 0
 
     lines = []
     lines.append("Производительность")
-    lines.append(f"1. Встречи - {get('meetings')} шт.")
-    lines.append(f"2. Встречи 1-4 звезды - {get('meetings_stars')} шт.")
-    lines.append(f"3. Открыто КНК - {get('knk_opened')} шт.")
-    lines.append(f"4. Реализовано ФЦКП - {get('fckp_realized')} шт.")
+    lines.append(f"1. Встречи - {get_int('meetings')} шт.")
+    lines.append(f"2. Встречи 1-4 звезды - {get_int('meetings_stars')} шт.")
+    lines.append(f"3. Открыто КНК - {get_int('knk_opened')} шт.")
+    lines.append(f"4. Реализовано ФЦКП - {get_int('fckp_realized')} шт.")
 
     # детализируем по продуктам (распечатать счётчики по каждому варианту)
-    products = data.get('fckp_products', []) or []
-    # посчитаем по всем возможным вариантам (чтобы печатать порядок)
+    products = data.get('fckp_products') or []
     prod_counts = {}
     for p in products:
         prod_counts[p] = prod_counts.get(p, 0) + 1
@@ -67,18 +66,16 @@ def format_report(data):
     # Печать всех вариантов в фиксированном порядке
     for opt in FCKP_OPTIONS:
         cnt = prod_counts.get(opt, 0)
-        if cnt > 0:
-            lines.append(f"{opt} - {cnt} шт")
-        else:
-            lines.append(f"{opt} - 0 шт")
+        lines.append(f"{opt} - {cnt} шт")
 
-    lines.append(f"5. Лизинг передано лидов - {get('leasing_leads')} шт.")
-    lines.append(f"6. Расчет кредитного потенциала - {get('credit_potential')} шт.")
-    lines.append(f"7. Кредиты выдано - {data.get('credits_issued', 0)} млн")
-    lines.append(f"8. ОТР - {get('otr')} шт.")
-    lines.append(f"9. Giga-ассистент - {get('giga_assistant')} шт.")
-    lines.append(f"10. ПУ - {get('pu')} шт.")
-    lines.append(f"11. Чатов - {get('chats')} шт")
+    lines.append(f"5. Лизинг передано лидов - {get_int('leasing_leads')} шт.")
+    lines.append(f"6. Расчет кредитного потенциала - {get_int('credit_potential')} шт.")
+    credits_val = data.get('credits_issued', 0)
+    lines.append(f"7. Кредиты выдано - {credits_val} млн")
+    lines.append(f"8. ОТР - {get_int('otr')} шт.")
+    lines.append(f"9. Giga-ассистент - {get_int('giga_assistant')} шт.")
+    lines.append(f"10. ПУ - {get_int('pu')} шт.")
+    lines.append(f"11. Чатов - {get_int('chats')} шт")
 
     return "\n".join(lines)
 

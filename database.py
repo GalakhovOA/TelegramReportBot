@@ -31,7 +31,6 @@ def init_db():
 def add_user(user_id, role, name=None, manager_fi=None):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # INSERT OR REPLACE to keep row by user_id
     cursor.execute('INSERT OR REPLACE INTO users (user_id, role, name, manager_fi) VALUES (?, ?, ?, ?)',
                    (user_id, role, name, manager_fi))
     conn.commit()
@@ -84,6 +83,10 @@ def get_manager_id_by_fi(manager_fi):
     return r[0] if r else None
 
 def save_report(user_id, report_data, date=None):
+    """
+    Сохраняет новый отчёт (INSERT). Если нужно перезаписать — вызовите delete + save или добавьте апдейт.
+    report_data ожидается как JSON-serializable dict.
+    """
     if date is None:
         date = datetime.now().strftime('%Y-%m-%d')
     conn = sqlite3.connect(DB_FILE)
@@ -94,9 +97,13 @@ def save_report(user_id, report_data, date=None):
     conn.close()
 
 def get_report(user_id, date):
+    """
+    Возвращает последний отчёт пользователя за date (или None).
+    """
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('SELECT report_data FROM reports WHERE user_id = ? AND report_date = ?', (user_id, date))
+    cursor.execute('SELECT report_data FROM reports WHERE user_id = ? AND report_date = ? ORDER BY id DESC LIMIT 1',
+                   (user_id, date))
     r = cursor.fetchone()
     conn.close()
     return json.loads(r[0]) if r else None
