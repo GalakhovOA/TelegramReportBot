@@ -29,7 +29,7 @@ user_states = {}
 def safe_state(uid):
     st = user_states.get(uid)
     if not st:
-        st = {'mode': 'manual', 'step': 0, 'data': {}, 'editing': False}
+        st = {'mode': 'idle', 'step': 0, 'data': {}, 'editing': False}
         user_states[uid] = st
     return st
 
@@ -38,7 +38,6 @@ def build_main_menu():
         [InlineKeyboardButton("Отчет МКК", callback_data='role_mkk')],
         [InlineKeyboardButton("Отчеты РТП", callback_data='role_rtp')],
         [InlineKeyboardButton("Отчеты РМ/МН", callback_data='role_rm')],
-        [InlineKeyboardButton("Ручное заполнение", callback_data='role_manual')],
         [InlineKeyboardButton("Сменить ФИ/РТП", callback_data='change_info')]
     ]
     return InlineKeyboardMarkup(kb)
@@ -86,7 +85,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_role_selection(query, uid, role)
         return
 
-    # choose RTP (for setting oneself or linking MKK)
+    # --- Выбор РТП (универсальная обработка) ---
+    # формат callback: choose_rtp_{idx}
     if data.startswith('choose_rtp_'):
         try:
             idx = int(data.split('_')[2])
@@ -97,32 +97,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Некорректный индекс РТП.")
             return
         selected = config.RTP_LIST[idx]
-        role = st.get('mode', 'manual')
+        role = st.get('mode', 'idle')
+
+        # если пользователь в процессе смены ФИ -> это flow: ввод имени -> выбор РТП
+        if st.get('change_flow'):
+            new_name = st.get('new_name')
+            if not new_name:
+                await query.edit_message_text("Ошибка: имя не найдено в состоянии. Начните заново через 'Сменить ФИ/РТП'.")
+                return
+            # сохраняем как mkk, привязанного к выбранному RТП
+            database.add_user(uid, 'mkk', new_name, selected)
+            user_states.pop(uid, None)
+            await query.edit_message_text(f"Готово. Ваше имя сохранено как '{new_name}', привязано к РТП: {selected}.")
+            return
+
+        # обычная логика: если роль = rtp, пользователь выбирает своё ФИ
         if role == 'rtp':
             database.add_user(uid, 'rtp', selected)
             user_states[uid] = {'mode': 'rtp', 'step': 0, 'data': {}, 'editing': False}
             await query.edit_message_text(f"Вы вошли как РТП: {selected}")
             await show_manager_menu(query)
             return
-        # else linking MKK
+
+        # если в процессе регистрации MKK: (обычная регистрация flow)
         name = st.get('name')
-        if not name:
-            await query.edit_message_text("Ошибка: имя не задано. Повторите ввод.")
+        if name:
+            database.add_user(uid, 'mkk', name, selected)
+            st.pop('choosing_rtp', None); st.pop('name', None)
+            st.update({'step': 0, 'data': {}, 'editing': False, 'mode': 'mkk'})
+            await query.edit_message_text(f"Привязка к {selected} успешна. Начинаем отчёт.")
+            await ask_next_question(query.message, uid)
             return
-        database.add_user(uid, 'mkk', name, selected)
-        st.pop('choosing_rtp', None); st.pop('name', None)
-        st.update({'step': 0, 'data': {}, 'editing': False, 'mode': 'mkk'})
-        await query.edit_message_text(f"Привязка к {selected} успешна. Начинаем отчёт.")
-        await ask_next_question(query.message, uid)
+
+        await query.edit_message_text("Непонятный контекст выбора РТП.")
         return
 
-    # RM: role menu
+    # RM role menu
     if data == 'role_rm':
-        # show RM menu
         await show_rm_menu(query)
         return
 
-    # choose RM_MN from list
+    # выбор РМ/МН из списка
     if data.startswith('choose_rm_'):
         try:
             idx = int(data.split('_')[2])
@@ -231,7 +246,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_document(chat_id=uid, document=InputFile(bio, filename=filename))
         return
 
-    # download global aggregated
     if data == 'download_global':
         date = datetime.now().strftime('%Y-%m-%d')
         all_combined = database.get_all_rtp_combined_on_date(date)
@@ -420,8 +434,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
 async def handle_role_selection(query_or_message, user_id, role):
+    # role: mkk, rtp, rm
     if role == 'rtp':
-        kb = [[InlineKeyboardButton(fi, callback_data=f"choose_rtp_{i}")] for i, fi in enumerate(config.RTP_LIST)]
+        kb = [[InlineKeyboardButton(fi, callback_data=f"choose_rtp_{i}")] for i,fi in enumerate(config.RTP_LIST)]
         kb.append([InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')])
         try:
             await query_or_message.edit_message_text("Выберите ваше ФИ (РТП):", reply_markup=InlineKeyboardMarkup(kb))
@@ -444,6 +459,7 @@ async def handle_role_selection(query_or_message, user_id, role):
                 pass
         return
 
+    # MKK flow: ask for name then choose RТП
     name = database.get_user_name(user_id)
     if role == 'mkk':
         if name:
@@ -473,18 +489,6 @@ async def handle_role_selection(query_or_message, user_id, role):
                 except Exception:
                     pass
             return
-
-    if role == 'manual':
-        user_states[user_id] = {'mode': 'manual', 'step': 0, 'data': {}, 'editing': False}
-        try:
-            await query_or_message.edit_message_text("Режим ручного заполнения. Начинаем.")
-        except Exception:
-            try:
-                await query_or_message.reply_text("Режим ручного заполнения. Начинаем.")
-            except Exception:
-                pass
-        await start_filling(query_or_message, user_id)
-        return
 
 async def show_rtp_buttons(query_or_message, text):
     kb = [[InlineKeyboardButton(fi, callback_data=f"choose_rtp_{i}")] for i,fi in enumerate(config.RTP_LIST)]
@@ -531,9 +535,31 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
         return
 
+    # -------------------------
+    # Смена ФИ / РТП (flow)
+    # -------------------------
+    if st.get('mode') == 'change_fi':
+        # state indicates we should ask for name
+        st['mode'] = 'change_fi_enter_name'
+        st.pop('entering_name', None)
+        await msg.reply_text("Введите ваше ФИ (как хотите, чтобы оно сохранилось):")
+        return
+
+    if st.get('mode') == 'change_fi_enter_name':
+        # save entered name and prompt choice of RТП
+        entered_name = text
+        st['new_name'] = entered_name
+        st['change_flow'] = True  # used in choose_rtp_ callback
+        # show rtp buttons to choose which RTP to bind to
+        await show_rtp_buttons(msg, f"Вы ввели имя: {entered_name}\nТеперь выберите вашего РТП из списка:")
+        return
+
+    # -------------------------
+    # Common flows for MKK / RTP / RM as before
+    # -------------------------
     if st.get('entering_name'):
         name = text
-        role = st.get('mode','manual')
+        role = st.get('mode','idle')
         st['name'] = name
         st.pop('entering_name', None)
         database.add_user(uid, 'mkk' if role == 'mkk' else role, name)
@@ -668,7 +694,7 @@ async def finish_report(msgobj, uid):
     for q in config.QUESTIONS:
         data.setdefault(q['key'], 0)
     try:
-        if st.get('mode') != 'manual':
+        if st.get('mode') != 'idle':
             database.save_report(uid, data)
     except Exception as e:
         print("DB save_report error:", e)
@@ -745,4 +771,3 @@ if __name__ == '__main__':
     asyncio.get_event_loop().run_until_complete(set_commands(app))
     print("Bot started")
     app.run_polling()
-
