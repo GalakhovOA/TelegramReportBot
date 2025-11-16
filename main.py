@@ -1,4 +1,4 @@
-# main.py
+# main.py (обновлённый)
 import os
 import asyncio
 from io import BytesIO
@@ -85,6 +85,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_role_selection(query, uid, role)
         return
 
+    # handle "Сменить ФИ/РТП" callback
+    if data == 'change_info':
+        # start change flow: ask for name immediately
+        user_states[uid] = {'mode': 'change_fi_enter_name'}
+        # edit the callback message to ask name (or send new message)
+        try:
+            await query.edit_message_text("Введите ваше ФИ (как хотите, чтобы оно сохранялось):")
+        except Exception:
+            await query.message.reply_text("Введите ваше ФИ (как хотите, чтобы оно сохранялось):")
+        return
+
     # --- Выбор РТП (универсальная обработка) ---
     # формат callback: choose_rtp_{idx}
     if data.startswith('choose_rtp_'):
@@ -99,7 +110,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         selected = config.RTP_LIST[idx]
         role = st.get('mode', 'idle')
 
-        # если пользователь в процессе смены ФИ -> это flow: ввод имени -> выбор РТП
+        # если пользователь в процессе смены ФИ -> flow: ввод имени -> выбор РТП
         if st.get('change_flow'):
             new_name = st.get('new_name')
             if not new_name:
@@ -183,6 +194,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         text = f"Объединённый отчёт РТП {chosen} на {date}:\n\n{config.format_report(combined)}"
         kb = [
+            # скачивание индивидуального РТП оставляем — RM может скачать (download_rtp_{idx})
             [InlineKeyboardButton("📥 Скачать .xlsx", callback_data=f"download_rtp_{idx}")],
             [InlineKeyboardButton("Назад", callback_data='rm_show_rtps')]
         ]
@@ -323,36 +335,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
         combined['fckp_products'] = fckp_products
         combined['fckp_realized'] = len(fckp_products)
+        # УБРАНА кнопка скачивания (по просьбе)
         text = f"Объединённый отчёт на {date}:\n\n{config.format_report(combined)}\n\n" + config.OPERATIONAL_DEFECTS_BLOCK
         kb = [
-            [InlineKeyboardButton("📥 Скачать .xlsx", callback_data="download_rtp_self")],
             [InlineKeyboardButton("Отправить РМ/МН", callback_data='rtp_send_to_rm')],
             [InlineKeyboardButton("Назад", callback_data='rtp_menu')]
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    if data == 'download_rtp_self':
-        manager_fi = database.get_user_name(uid)
-        date = datetime.now().strftime('%Y-%m-%d')
-        combined = database.get_rtp_combined(manager_fi, date)
-        if not combined:
-            await query.edit_message_text("Нет объединённого отчёта для скачивания.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data='rtp_menu')]]))
-            return
-        rows = []
-        for q in config.QUESTIONS:
-            rows.append({'key': q['question'], 'value': combined.get(q['key'], 0)})
-        prod_counts = {}
-        for p in combined.get('fckp_products', []):
-            prod_counts[p] = prod_counts.get(p, 0) + 1
-        for prod in config.FCKP_OPTIONS:
-            rows.append({'key': prod, 'value': prod_counts.get(prod, 0)})
-        cols = [('key','Поле'), ('value','Значение')]
-        bio = generate_xlsx_for_report(f"{manager_fi}_{date}", rows, cols)
-        filename = f"rtp_{manager_fi.replace(' ','_')}_{date}.xlsx"
-        await context.bot.send_document(chat_id=uid, document=InputFile(bio, filename=filename))
-        return
-
+    # when RTP sends combined to RM: save combined
     if data == 'rtp_send_to_rm':
         manager_fi = database.get_user_name(uid)
         date = datetime.now().strftime('%Y-%m-%d')
@@ -403,7 +395,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await ask_next_question(query.message, uid)
             return
 
-    # download individual user report (for RTP view)
+    # download individual user report (for RTP view) - kept
     if data.startswith('download_user_'):
         try:
             parts = data.split('_')
@@ -428,6 +420,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bio = generate_xlsx_for_report(f"user_{target_uid}_{date}", rows, cols)
         filename = f"user_{target_uid}_{date}.xlsx"
         await context.bot.send_document(chat_id=uid, document=InputFile(bio, filename=filename))
+        return
+
+    # send personal report to manager (callback from MKK final menu)
+    if data == 'send_report':
+        # call helper that sends report to manager
+        success, msg_text = await send_personal_report_to_manager(uid, context)
+        # provide clear confirmation to user (edit message from which they pressed)
+        try:
+            if success:
+                await query.edit_message_text("Отчёт успешно отправлен руководителю.")
+            else:
+                await query.edit_message_text(f"Отчет отправлен, но пока {msg_text}")
+        except Exception:
+            try:
+                await query.message.reply_text("Отчёт отправлен (или произошла ошибка, проверьте лог).")
+            except Exception:
+                pass
         return
 
     # fallback
@@ -538,13 +547,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -------------------------
     # Смена ФИ / РТП (flow)
     # -------------------------
-    if st.get('mode') == 'change_fi':
-        # state indicates we should ask for name
-        st['mode'] = 'change_fi_enter_name'
-        st.pop('entering_name', None)
-        await msg.reply_text("Введите ваше ФИ (как хотите, чтобы оно сохранилось):")
-        return
-
     if st.get('mode') == 'change_fi_enter_name':
         # save entered name and prompt choice of RТП
         entered_name = text
@@ -706,9 +708,9 @@ async def finish_report(msgobj, uid):
             await msgobj.message.reply_text(f"Итоговый отчет:\n{formatted}")
         except Exception:
             pass
+    # УБРАНА кнопка "Сменить ФИ/РТП" из финального меню
     kb = [
-        [InlineKeyboardButton("Редактировать", callback_data='edit_report')],
-        [InlineKeyboardButton("Сменить ФИ/РТП", callback_data='change_info')]
+        [InlineKeyboardButton("Редактировать", callback_data='edit_report')]
     ]
     if st.get('mode') == 'mkk':
         kb[0].insert(1, InlineKeyboardButton("Отправить руководителю", callback_data='send_report'))
@@ -720,7 +722,7 @@ async def finish_report(msgobj, uid):
 # helper menus
 async def show_manager_menu(q):
     kb = [
-        [InlineKeyboardButton("Показать отчеты на дату", callback_data='rtp_show_reports')],
+        [InlineKeyboardButton("Показать кто сдал отчет", callback_data='rtp_show_reports')],
         [InlineKeyboardButton("Детальный отчет на дату", callback_data='rtp_detailed_reports')],
         [InlineKeyboardButton("Объединить и показать отчеты на дату", callback_data='rtp_combine_reports')],
         [InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')]
