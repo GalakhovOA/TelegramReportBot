@@ -1,4 +1,4 @@
-# main.py (обновлённый)
+# main.py
 import os
 import asyncio
 from io import BytesIO
@@ -6,10 +6,10 @@ from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, InputFile
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-import openpyxl
 
 import config
 import database
+import json
 
 # load .env
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,7 +23,6 @@ TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     print("ERROR: BOT_TOKEN not found in env (BOT_TOKEN)")
 
-# runtime state
 user_states = {}
 
 def safe_state(uid):
@@ -42,8 +41,12 @@ def build_main_menu():
     ]
     return InlineKeyboardMarkup(kb)
 
-# xlsx generator (rows = list[dict], columns = [(key, title), ...])
+# --- Helpers for xlsx generation (used by RM) ---
 def generate_xlsx_for_report(title: str, rows: list, columns: list):
+    try:
+        import openpyxl
+    except Exception:
+        raise
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = title[:31]
@@ -58,7 +61,7 @@ def generate_xlsx_for_report(title: str, rows: list, columns: list):
     bio.seek(0)
     return bio
 
-# handlers
+# --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.effective_message
     await msg.reply_text("Выберите роль:", reply_markup=build_main_menu())
@@ -78,26 +81,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Выберите роль:", reply_markup=build_main_menu())
         return
 
-    # role selection
+    # role selection (common)
     if data.startswith('role_'):
         role = data.split('_',1)[1]
-        user_states[uid] = {'mode': role, 'step': 0, 'data': {}, 'editing': False}
-        await handle_role_selection(query, uid, role)
-        return
+        # For RTP and RM: require password if user not verified
+        if role in ('rtp', 'rm'):
+            if database.is_user_verified(uid):
+                user_states[uid] = {'mode': role, 'step': 0, 'data': {}, 'editing': False}
+                await handle_role_selection(query, uid, role)
+                return
+            else:
+                user_states[uid] = {'mode': 'awaiting_password_for', 'await_role': role}
+                try:
+                    await query.edit_message_text("Введите пароль для доступа в раздел руководителя:")
+                except Exception:
+                    await query.message.reply_text("Введите пароль для доступа в раздел руководителя:")
+                return
+        else:
+            # mkk flow
+            user_states[uid] = {'mode': role, 'step': 0, 'data': {}, 'editing': False}
+            await handle_role_selection(query, uid, role)
+            return
 
-    # handle "Сменить ФИ/РТП" callback
+    # change_info
     if data == 'change_info':
-        # start change flow: ask for name immediately
         user_states[uid] = {'mode': 'change_fi_enter_name'}
-        # edit the callback message to ask name (or send new message)
         try:
             await query.edit_message_text("Введите ваше ФИ (как хотите, чтобы оно сохранялось):")
         except Exception:
             await query.message.reply_text("Введите ваше ФИ (как хотите, чтобы оно сохранялось):")
         return
 
-    # --- Выбор РТП (универсальная обработка) ---
-    # формат callback: choose_rtp_{idx}
+    # choose_rtp_{idx}
     if data.startswith('choose_rtp_'):
         try:
             idx = int(data.split('_')[2])
@@ -108,29 +123,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Некорректный индекс РТП.")
             return
         selected = config.RTP_LIST[idx]
-        role = st.get('mode', 'idle')
-
-        # если пользователь в процессе смены ФИ -> flow: ввод имени -> выбор РТП
+        # if in change_flow (user entered new name earlier)
         if st.get('change_flow'):
             new_name = st.get('new_name')
             if not new_name:
-                await query.edit_message_text("Ошибка: имя не найдено в состоянии. Начните заново через 'Сменить ФИ/РТП'.")
+                await query.edit_message_text("Ошибка: имя не найдено в состоянии.")
                 return
-            # сохраняем как mkk, привязанного к выбранному RТП
             database.add_user(uid, 'mkk', new_name, selected)
             user_states.pop(uid, None)
-            await query.edit_message_text(f"Готово. Ваше имя сохранено как '{new_name}', привязано к РТП: {selected}.")
+            await query.edit_message_text(f"Готово. Ваше имя '{new_name}' привязано к РТП: {selected}.")
             return
 
-        # обычная логика: если роль = rtp, пользователь выбирает своё ФИ
+        role = st.get('mode', 'idle')
         if role == 'rtp':
+            # user choosing their own FI as RTP
             database.add_user(uid, 'rtp', selected)
+            # when RTP chooses own FI, ensure verified flag set (they passed password earlier)
+            database.set_user_verified(uid, 1)
             user_states[uid] = {'mode': 'rtp', 'step': 0, 'data': {}, 'editing': False}
             await query.edit_message_text(f"Вы вошли как РТП: {selected}")
             await show_manager_menu(query)
             return
 
-        # если в процессе регистрации MKK: (обычная регистрация flow)
+        # registration flow for MKK
         name = st.get('name')
         if name:
             database.add_user(uid, 'mkk', name, selected)
@@ -143,28 +158,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Непонятный контекст выбора РТП.")
         return
 
-    # RM role menu
-    if data == 'role_rm':
-        await show_rm_menu(query)
-        return
-
-    # выбор РМ/МН из списка
+    # choose_rm_{idx} - RM selects their FI from list
     if data.startswith('choose_rm_'):
         try:
             idx = int(data.split('_')[2])
         except Exception:
-            await query.edit_message_text("Ошибка выбора.")
+            await query.edit_message_text("Ошибка выбора РМ/МН.")
             return
         if idx < 0 or idx >= len(config.RM_MN_LIST):
-            await query.edit_message_text("Некорректный индекс РМ/МН.")
+            await query.edit_message_text("Некорректный индекс.")
             return
-        selected = config.RM_MN_LIST[idx]
-        database.add_user(uid, 'rm', selected)
-        await query.edit_message_text(f"Вы вошли как РМ/МН: {selected}")
-        await show_rm_menu(query)
+        chosen = config.RM_MN_LIST[idx]
+        # register user as rm and mark verified
+        database.add_user(uid, 'rm', chosen)
+        database.set_user_verified(uid, 1)
+        user_states[uid] = {'mode': 'rm', 'step': 0, 'data': {}, 'editing': False}
+        kb = [
+            [InlineKeyboardButton("Список РТП", callback_data='rm_show_rtps')],
+            [InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')]
+        ]
+        await query.edit_message_text(f"Вы вошли как РМ/МН: {chosen}", reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    # RM menu commands
+    # role_rm -> show RM menu (entry)
+    if data == 'role_rm':
+        if database.is_user_verified(uid):
+            await handle_role_selection(query, uid, 'rm')
+            return
+        else:
+            user_states[uid] = {'mode': 'awaiting_password_for', 'await_role': 'rm'}
+            try:
+                await query.edit_message_text("Введите пароль для доступа в раздел руководителя:")
+            except Exception:
+                await query.message.reply_text("Введите пароль для доступа в раздел руководителя:")
+            return
+
+    # RM menu interactions
     if data == 'rm_show_rtps':
         date = datetime.now().strftime('%Y-%m-%d')
         sent_status = database.get_rtp_combined_status_for_all(config.RTP_LIST, date)
@@ -178,6 +207,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith('rm_choose_rtp_'):
+        # format: rm_choose_rtp_{i}
         try:
             idx = int(data.split('_')[3])
         except Exception:
@@ -194,7 +224,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         text = f"Объединённый отчёт РТП {chosen} на {date}:\n\n{config.format_report(combined)}"
         kb = [
-            # скачивание индивидуального РТП оставляем — RM может скачать (download_rtp_{idx})
             [InlineKeyboardButton("📥 Скачать .xlsx", callback_data=f"download_rtp_{idx}")],
             [InlineKeyboardButton("Назад", callback_data='rm_show_rtps')]
         ]
@@ -215,7 +244,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     fckp_products.extend(v)
                 else:
                     try:
-                        aggregated[k] = aggregated.get(k, 0) + int(v or 0)
+                        aggregated[k] = aggregated.get(k, 0) + float(v or 0)
                     except Exception:
                         pass
         aggregated['fckp_products'] = fckp_products
@@ -228,7 +257,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    # download rtp combined by rm
     if data.startswith('download_rtp_'):
         try:
             idx = int(data.split('_')[2])
@@ -253,9 +281,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for prod in config.FCKP_OPTIONS:
             rows.append({'key': prod, 'value': prod_counts.get(prod, 0)})
         cols = [('key', 'Поле'), ('value', 'Значение')]
-        bio = generate_xlsx_for_report(f"{rtp_fi}_{date}", rows, cols)
-        filename = f"rtp_{rtp_fi.replace(' ','_')}_{date}.xlsx"
-        await context.bot.send_document(chat_id=uid, document=InputFile(bio, filename=filename))
+        try:
+            bio = generate_xlsx_for_report(f"{rtp_fi}_{date}", rows, cols)
+            filename = f"rtp_{rtp_fi.replace(' ','_')}_{date}.xlsx"
+            await context.bot.send_document(chat_id=uid, document=InputFile(bio, filename=filename))
+        except Exception as e:
+            await query.edit_message_text(f"Ошибка формирования файла: {e}")
         return
 
     if data == 'download_global':
@@ -272,19 +303,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for q in config.QUESTIONS:
             cols.append((q['key'], q['question']))
         cols.append(('fckp_count', 'FCKP count'))
-        bio = generate_xlsx_for_report(f"global_{date}", rows, cols)
-        filename = f"global_combined_{date}.xlsx"
-        await context.bot.send_document(chat_id=uid, document=InputFile(bio, filename=filename))
+        try:
+            bio = generate_xlsx_for_report(f"global_{date}", rows, cols)
+            filename = f"global_combined_{date}.xlsx"
+            await context.bot.send_document(chat_id=uid, document=InputFile(bio, filename=filename))
+        except Exception as e:
+            await query.edit_message_text(f"Ошибка формирования файла: {e}")
         return
 
-    # RTP menu selection
+    # role_rtp menu (entry)
     if data == 'role_rtp':
-        kb = [[InlineKeyboardButton(fi, callback_data=f"choose_rtp_{i}")] for i, fi in enumerate(config.RTP_LIST)]
-        kb.append([InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')])
-        await query.edit_message_text("Выберите ваше ФИ (РТП):", reply_markup=InlineKeyboardMarkup(kb))
-        return
+        if database.is_user_verified(uid):
+            kb = [[InlineKeyboardButton(fi, callback_data=f"choose_rtp_{i}")] for i, fi in enumerate(config.RTP_LIST)]
+            kb.append([InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')])
+            await query.edit_message_text("Выберите ваше ФИ (РТП):", reply_markup=InlineKeyboardMarkup(kb))
+            return
+        else:
+            user_states[uid] = {'mode': 'awaiting_password_for', 'await_role': 'rtp'}
+            try:
+                await query.edit_message_text("Введите пароль для доступа в раздел РТП:")
+            except Exception:
+                await query.message.reply_text("Введите пароль для доступа в раздел РТП:")
+            return
 
-    # RTP manager menu actions
+    # RTP manager actions
     if data == 'rtp_menu':
         await show_manager_menu(query)
         return
@@ -299,7 +341,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for u_id, name in employees:
             status = '✅' if u_id in reported_ids else '❌'
             text += f"Сотрудник {name or str(u_id)}: {status}\n"
-        kb = [[InlineKeyboardButton("Выбрать другую дату", callback_data='select_date_show')], [InlineKeyboardButton("Назад", callback_data='rtp_menu')]]
+        kb = [[InlineKeyboardButton("Детальный отчет на дату", callback_data='rtp_detailed_reports')], [InlineKeyboardButton("Назад", callback_data='rtp_menu')]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
         return
 
@@ -311,7 +353,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for u_id, rdata in reports:
             name = database.get_user_name(u_id) or str(u_id)
             text += f"Сотрудник {name}:\n{config.format_report(rdata)}\n\n"
-        kb = [[InlineKeyboardButton("Выбрать другую дату", callback_data='select_date_detailed')], [InlineKeyboardButton("Назад", callback_data='rtp_menu')]]
+        kb = [[InlineKeyboardButton("Вернуться в меню", callback_data='rtp_menu')]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
         return
 
@@ -330,12 +372,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     fckp_products.extend(v)
                 else:
                     try:
-                        combined[k] = combined.get(k, 0) + int(v or 0)
+                        combined[k] = combined.get(k, 0) + float(v or 0)
                     except Exception:
                         pass
         combined['fckp_products'] = fckp_products
         combined['fckp_realized'] = len(fckp_products)
-        # УБРАНА кнопка скачивания (по просьбе)
         text = f"Объединённый отчёт на {date}:\n\n{config.format_report(combined)}\n\n" + config.OPERATIONAL_DEFECTS_BLOCK
         kb = [
             [InlineKeyboardButton("Отправить РМ/МН", callback_data='rtp_send_to_rm')],
@@ -344,7 +385,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    # when RTP sends combined to RM: save combined
     if data == 'rtp_send_to_rm':
         manager_fi = database.get_user_name(uid)
         date = datetime.now().strftime('%Y-%m-%d')
@@ -360,7 +400,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     fckp_products.extend(v)
                 else:
                     try:
-                        combined[k] = combined.get(k, 0) + int(v or 0)
+                        combined[k] = combined.get(k, 0) + float(v or 0)
                     except Exception:
                         pass
         combined['fckp_products'] = fckp_products
@@ -369,7 +409,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Объединённый отчёт сохранён и доступен РМ/МН.")
         return
 
-    # fckp product selection (MKK)
+    # FCKP product picking
     if data.startswith('fckp_prod_'):
         prod = data.split('fckp_prod_',1)[1]
         st = safe_state(uid)
@@ -395,7 +435,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await ask_next_question(query.message, uid)
             return
 
-    # download individual user report (for RTP view) - kept
+    # download individual user report (RTP view)
     if data.startswith('download_user_'):
         try:
             parts = data.split('_')
@@ -417,21 +457,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for prod in config.FCKP_OPTIONS:
             rows.append({'key': prod, 'value': prod_counts.get(prod,0)})
         cols = [('key','Поле'), ('value','Значение')]
-        bio = generate_xlsx_for_report(f"user_{target_uid}_{date}", rows, cols)
-        filename = f"user_{target_uid}_{date}.xlsx"
-        await context.bot.send_document(chat_id=uid, document=InputFile(bio, filename=filename))
+        try:
+            bio = generate_xlsx_for_report(f"user_{target_uid}_{date}", rows, cols)
+            filename = f"user_{target_uid}_{date}.xlsx"
+            await context.bot.send_document(chat_id=uid, document=InputFile(bio, filename=filename))
+        except Exception as e:
+            await query.edit_message_text(f"Ошибка формирования файла: {e}")
         return
 
-    # send personal report to manager (callback from MKK final menu)
     if data == 'send_report':
-        # call helper that sends report to manager
         success, msg_text = await send_personal_report_to_manager(uid, context)
-        # provide clear confirmation to user (edit message from which they pressed)
         try:
             if success:
                 await query.edit_message_text("Отчёт успешно отправлен руководителю.")
             else:
-                await query.edit_message_text(f"Отчет отправлен, но пока {msg_text}")
+                await query.edit_message_text(f"Отчет отправлен, но {msg_text}")
         except Exception:
             try:
                 await query.message.reply_text("Отчёт отправлен (или произошла ошибка, проверьте лог).")
@@ -442,8 +482,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # fallback
     return
 
+# role selection helper
 async def handle_role_selection(query_or_message, user_id, role):
-    # role: mkk, rtp, rm
+    name = database.get_user_name(user_id)
     if role == 'rtp':
         kb = [[InlineKeyboardButton(fi, callback_data=f"choose_rtp_{i}")] for i,fi in enumerate(config.RTP_LIST)]
         kb.append([InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')])
@@ -469,7 +510,6 @@ async def handle_role_selection(query_or_message, user_id, role):
         return
 
     # MKK flow: ask for name then choose RТП
-    name = database.get_user_name(user_id)
     if role == 'mkk':
         if name:
             manager_fi = database.get_manager_fi_for_employee(user_id)
@@ -510,16 +550,18 @@ async def show_rtp_buttons(query_or_message, text):
         except Exception:
             pass
 
-async def show_rm_menu(query):
+async def show_manager_menu(q):
     kb = [
-        [InlineKeyboardButton("Просмотреть список РТП и статус", callback_data='rm_show_rtps')],
+        [InlineKeyboardButton("Показать отчеты на дату", callback_data='rtp_show_reports')],
+        [InlineKeyboardButton("Детальный отчет на дату", callback_data='rtp_detailed_reports')],
+        [InlineKeyboardButton("Объединить и показать отчеты на дату", callback_data='rtp_combine_reports')],
         [InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')]
     ]
     try:
-        await query.edit_message_text("Меню РМ/МН:", reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text("Меню руководителя:", reply_markup=InlineKeyboardMarkup(kb))
     except Exception:
         try:
-            await query.message.reply_text("Меню РМ/МН:", reply_markup=InlineKeyboardMarkup(kb))
+            await q.message.reply_text("Меню руководителя:", reply_markup=InlineKeyboardMarkup(kb))
         except Exception:
             pass
 
@@ -544,21 +586,36 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
         return
 
-    # -------------------------
-    # Смена ФИ / РТП (flow)
-    # -------------------------
+    # Password entry flow for RTP/RM (variant B)
+    if st.get('mode') == 'awaiting_password_for':
+        await_role = st.get('await_role')
+        if text.lower() == 'отмена' or text.lower() == 'cancel':
+            user_states.pop(uid, None)
+            await msg.reply_text("Отмена. Возврат в меню.", reply_markup=build_main_menu())
+            return
+        # check password
+        if text == config.ADMIN_PASSWORD:
+            # ensure user row exists and mark verified
+            database.add_user(uid, await_role)
+            # don't override name; set_user_name called only if present
+            database.set_user_verified(uid, 1)
+            user_states[uid] = {'mode': await_role, 'step': 0, 'data': {}, 'editing': False}
+            await msg.reply_text("Пароль верный. Доступ предоставлен.")
+            await handle_role_selection(msg, uid, await_role)
+            return
+        else:
+            await msg.reply_text("Неверный пароль. Попробуйте снова")
+            return
+
+    # change FI flow
     if st.get('mode') == 'change_fi_enter_name':
-        # save entered name and prompt choice of RТП
         entered_name = text
         st['new_name'] = entered_name
-        st['change_flow'] = True  # used in choose_rtp_ callback
-        # show rtp buttons to choose which RTP to bind to
+        st['change_flow'] = True
         await show_rtp_buttons(msg, f"Вы ввели имя: {entered_name}\nТеперь выберите вашего РТП из списка:")
         return
 
-    # -------------------------
-    # Common flows for MKK / RTP / RM as before
-    # -------------------------
+    # Registration flows (MKK name entering)
     if st.get('entering_name'):
         name = text
         role = st.get('mode','idle')
@@ -576,66 +633,27 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Пожалуйста, выберите РТП из списка кнопок.")
         return
 
-    if 'select_mode' in st:
-        try:
-            date = datetime.strptime(text, '%Y-%m-%d').strftime('%Y-%m-%d')
-            mode = st.pop('select_mode', None)
-            if mode == 'show':
-                manager_fi = database.get_user_name(uid) if st.get('mode') == 'rtp' else None
-                employees = database.get_employees(manager_fi)
-                reports = database.get_all_reports_on_date(date, manager_fi)
-                reported_ids = [u for u,_ in reports]
-                text_out = f"Отчеты на {date}:\n"
-                for u_id, name in employees:
-                    status = '✅' if u_id in reported_ids else '❌'
-                    text_out += f"Сотрудник {name or str(u_id)}: {status}\n"
-                await msg.reply_text(text_out)
-            elif mode == 'detailed':
-                manager_fi = database.get_user_name(uid)
-                reports = database.get_all_reports_on_date(date, manager_fi)
-                text_out = f"Детальные отчеты на {date}:\n"
-                for u_id, rdata in reports:
-                    name = database.get_user_name(u_id) or str(u_id)
-                    text_out += f"Сотрудник {name}:\n{config.format_report(rdata)}\n\n"
-                await msg.reply_text(text_out)
-            elif mode == 'combine':
-                manager_fi = database.get_user_name(uid)
-                reports = database.get_all_reports_on_date(date, manager_fi)
-                if not reports:
-                    await msg.reply_text("Нет отчетов на эту дату.")
-                    return
-                combined = {}
-                fckp_products = []
-                for _, r in reports:
-                    for k, v in r.items():
-                        if k == 'fckp_products' and isinstance(v, list):
-                            fckp_products.extend(v)
-                        else:
-                            try:
-                                combined[k] = combined.get(k, 0) + int(v or 0)
-                            except Exception:
-                                pass
-                combined['fckp_products'] = fckp_products
-                combined['fckp_realized'] = len(fckp_products)
-                out = config.format_report(combined) + "\n\n" + config.OPERATIONAL_DEFECTS_BLOCK
-                await msg.reply_text(out)
-            return
-        except ValueError:
-            await msg.reply_text("Неверный формат даты. Попробуйте YYYY-MM-DD.")
-            return
-
-    # questionnaire
+    # Now questionnaire: accept floats (and ints)
     if 'step' not in st:
         return
 
     step = st['step']
     if step < len(config.QUESTIONS):
         q = config.QUESTIONS[step]
-        if not text.isdigit():
-            await msg.reply_text("Пожалуйста, введите число (цифрами).")
+        # Accept float-like input (allow comma)
+        t = text.replace(',', '.')
+        try:
+            if t == '':
+                val = 0.0
+            else:
+                val = float(t)
+        except Exception:
+            await msg.reply_text("Пожалуйста, введите число (можно дробное, например 1.5 либо 0,7).")
             return
+
+        # special handling for fckp_realized (asks for product choices)
         if q['key'] == 'fckp_realized':
-            n = int(text)
+            n = int(val)
             st['data'][q['key']] = n
             if n > 0:
                 st['fckp_left'] = n
@@ -648,7 +666,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await ask_next_question(msg, uid)
                 return
         else:
-            st['data'][q['key']] = int(text)
+            st['data'][q['key']] = str(val)
             st['step'] += 1
             await ask_next_question(msg, uid)
             return
@@ -693,6 +711,7 @@ async def finish_report(msgobj, uid):
     if 'fckp_products' in st and st.get('fckp_products'):
         data['fckp_products'] = st.get('fckp_products')
         data['fckp_realized'] = len(st.get('fckp_products'))
+    # ensure all questions present
     for q in config.QUESTIONS:
         data.setdefault(q['key'], 0)
     try:
@@ -708,7 +727,7 @@ async def finish_report(msgobj, uid):
             await msgobj.message.reply_text(f"Итоговый отчет:\n{formatted}")
         except Exception:
             pass
-    # УБРАНА кнопка "Сменить ФИ/РТП" из финального меню
+    # Final actions menu (no change_info here per request)
     kb = [
         [InlineKeyboardButton("Редактировать", callback_data='edit_report')]
     ]
@@ -718,22 +737,6 @@ async def finish_report(msgobj, uid):
         await msgobj.reply_text("Действия:", reply_markup=InlineKeyboardMarkup(kb))
     except Exception:
         pass
-
-# helper menus
-async def show_manager_menu(q):
-    kb = [
-        [InlineKeyboardButton("Показать кто сдал отчет", callback_data='rtp_show_reports')],
-        [InlineKeyboardButton("Детальный отчет на дату", callback_data='rtp_detailed_reports')],
-        [InlineKeyboardButton("Объединить и показать отчеты на дату", callback_data='rtp_combine_reports')],
-        [InlineKeyboardButton("Вернуться в меню", callback_data='return_to_menu')]
-    ]
-    try:
-        await q.edit_message_text("Меню руководителя:", reply_markup=InlineKeyboardMarkup(kb))
-    except Exception:
-        try:
-            await q.message.reply_text("Меню руководителя:", reply_markup=InlineKeyboardMarkup(kb))
-        except Exception:
-            pass
 
 async def send_personal_report_to_manager(uid, context):
     date = datetime.now().strftime('%Y-%m-%d')
@@ -747,7 +750,7 @@ async def send_personal_report_to_manager(uid, context):
         return False, "Руководитель не привязан"
     manager_id = database.get_manager_id_by_fi(manager_fi)
     if not manager_id:
-        return False, f"Руководитель {manager_fi} не найден в системе"
+        return False, f"руководитель {manager_fi} не найден в системе"
     try:
         await context.bot.send_message(chat_id=manager_id, text=f"Отчёт от сотрудника {name} на {date}:\n{formatted}")
         return True, "Отчёт отправлен"
